@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -43,6 +44,14 @@ type model struct {
 	issues  []string
 }
 
+type generationError struct {
+	err error
+}
+
+func (e generationError) Error() string {
+	return e.err.Error()
+}
+
 type copyPair struct {
 	srcName      string
 	dstName      string
@@ -57,11 +66,16 @@ type copyPair struct {
 
 type fieldCopy struct {
 	srcName     string
+	srcExpr     string
 	dstName     string
 	flags       uint8
 	zeroExpr    string
 	assignExpr  string
+	nilSafe     bool
+	zeroAssign  string
+	nested      []fieldCopy
 	insensitive bool
+	importTypes []types.Type
 }
 
 const (
@@ -113,6 +127,11 @@ func loadModel(dir string, rawPairs []string) (model, error) {
 		}
 		fallback.issues = append(m.issues, fallback.issues...)
 		return fallback, nil
+	} else {
+		var genErr generationError
+		if errors.As(err, &genErr) {
+			return model{}, genErr.err
+		}
 	}
 	return loadModelStd(dir, rawPairs)
 }
@@ -151,7 +170,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 		seen[key] = true
 		built, err := buildPairFromTypes(pair, pkg.PkgPath)
 		if err != nil {
-			return model{}, err
+			return model{}, generationError{err: err}
 		}
 		m.pairs = append(m.pairs, built)
 	}
@@ -243,6 +262,7 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 	var pairs []copyPair
 	var issues []string
 	for _, file := range files {
+		explicitTypes := collectExplicitTypes(file, pkg)
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok || len(call.Args) < 2 {
@@ -253,8 +273,8 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 			}
 			pos := fset.Position(call.Lparen)
 			location := fmt.Sprintf("%s:%d", filepath.Base(pos.Filename), pos.Line)
-			dstType := info.TypeOf(call.Args[0])
-			srcType := info.TypeOf(call.Args[1])
+			dstType := copyExpressionType(info, file, pkg, explicitTypes, call.Args[0])
+			srcType := copyExpressionType(info, file, pkg, explicitTypes, call.Args[1])
 			dstNamed, _, ok := namedStructFromCopyArg(dstType)
 			if !ok {
 				issues = append(issues, fmt.Sprintf("%s: destination argument is not a pointer to named struct: %s", location, typeKeyOrUnknown(dstType)))
@@ -287,6 +307,186 @@ func typeKeyOrUnknown(t types.Type) string {
 		return "<unknown>"
 	}
 	return typeKey(t)
+}
+
+func copyExpressionType(info *types.Info, file *ast.File, pkg *types.Package, explicitTypes map[string]types.Type, expr ast.Expr) types.Type {
+	if info == nil {
+		return nil
+	}
+	if t := info.TypeOf(expr); t != nil && !isInvalidType(t) {
+		return t
+	}
+	switch e := expr.(type) {
+	case *ast.Ident:
+		return explicitTypes[e.Name]
+	case *ast.UnaryExpr:
+		if e.Op != token.AND {
+			return nil
+		}
+		inner := copyExpressionType(info, file, pkg, explicitTypes, e.X)
+		if inner == nil {
+			return nil
+		}
+		return types.NewPointer(inner)
+	case *ast.SelectorExpr:
+		return selectorExpressionType(info, file, pkg, explicitTypes, e)
+	}
+	return nil
+}
+
+func selectorExpressionType(info *types.Info, file *ast.File, pkg *types.Package, explicitTypes map[string]types.Type, expr *ast.SelectorExpr) types.Type {
+	receiver := copyExpressionType(info, file, pkg, explicitTypes, expr.X)
+	if receiver == nil {
+		return nil
+	}
+	for {
+		ptr, ok := receiver.(*types.Pointer)
+		if !ok {
+			break
+		}
+		receiver = ptr.Elem()
+	}
+	named, ok := receiver.(*types.Named)
+	if !ok {
+		return nil
+	}
+	st, ok := named.Underlying().(*types.Struct)
+	if !ok {
+		return nil
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		field := st.Field(i)
+		if field.Name() == expr.Sel.Name {
+			return field.Type()
+		}
+	}
+	return nil
+}
+
+func collectExplicitTypes(file *ast.File, pkg *types.Package) map[string]types.Type {
+	explicitTypes := map[string]types.Type{}
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch n := node.(type) {
+		case *ast.GenDecl:
+			if n.Tok != token.VAR {
+				return true
+			}
+			for _, spec := range n.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok || valueSpec.Type == nil {
+					continue
+				}
+				t := resolveTypeExpr(file, pkg, valueSpec.Type)
+				if t == nil {
+					continue
+				}
+				for _, name := range valueSpec.Names {
+					explicitTypes[name.Name] = t
+				}
+			}
+		case *ast.FuncDecl:
+			collectFieldListTypes(file, pkg, explicitTypes, n.Type.Params)
+			if n.Type.Results != nil {
+				collectFieldListTypes(file, pkg, explicitTypes, n.Type.Results)
+			}
+		}
+		return true
+	})
+	return explicitTypes
+}
+
+func collectFieldListTypes(file *ast.File, pkg *types.Package, explicitTypes map[string]types.Type, fields *ast.FieldList) {
+	if fields == nil {
+		return
+	}
+	for _, field := range fields.List {
+		t := resolveTypeExpr(file, pkg, field.Type)
+		if t == nil {
+			continue
+		}
+		for _, name := range field.Names {
+			explicitTypes[name.Name] = t
+		}
+	}
+}
+
+func resolveTypeExpr(file *ast.File, pkg *types.Package, expr ast.Expr) types.Type {
+	switch e := expr.(type) {
+	case *ast.StarExpr:
+		inner := resolveTypeExpr(file, pkg, e.X)
+		if inner == nil {
+			return nil
+		}
+		return types.NewPointer(inner)
+	case *ast.Ident:
+		if obj := pkg.Scope().Lookup(e.Name); obj != nil {
+			return obj.Type()
+		}
+	case *ast.SelectorExpr:
+		alias, ok := e.X.(*ast.Ident)
+		if !ok {
+			return nil
+		}
+		importPath := importPathForAlias(file, alias.Name)
+		if importPath == "" {
+			return nil
+		}
+		for _, imported := range pkg.Imports() {
+			if imported.Path() != importPath {
+				continue
+			}
+			obj := imported.Scope().Lookup(e.Sel.Name)
+			if obj != nil {
+				return obj.Type()
+			}
+		}
+	}
+	return nil
+}
+
+func importPathForAlias(file *ast.File, alias string) string {
+	for _, imp := range file.Imports {
+		path := strings.Trim(imp.Path.Value, `"`)
+		name := ""
+		if imp.Name != nil {
+			name = imp.Name.Name
+		} else {
+			parts := strings.Split(path, "/")
+			name = parts[len(parts)-1]
+		}
+		if name == alias {
+			return path
+		}
+	}
+	return ""
+}
+
+func copyDestinationType(info *types.Info, expr ast.Expr) types.Type {
+	if info == nil {
+		return nil
+	}
+	if t := info.TypeOf(expr); t != nil {
+		return t
+	}
+	unary, ok := expr.(*ast.UnaryExpr)
+	if !ok || unary.Op != token.AND {
+		return nil
+	}
+	inner := info.TypeOf(unary.X)
+	if isInvalidType(inner) {
+		inner = nil
+	}
+	if inner == nil {
+		return nil
+	}
+	return types.NewPointer(inner)
+}
+
+func isInvalidType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	return types.TypeString(t, func(*types.Package) string { return "" }) == "invalid type"
 }
 
 func isCopierCall(file *ast.File, call *ast.CallExpr, info *types.Info) bool {
@@ -398,21 +598,92 @@ func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
 
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), "from."+srcField.Name(), currentPkg)
 		if !ok {
-			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s cannot assign %s to %s",
-				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), typeKey(srcField.Type()), typeKey(dstField.Type()))
+			nested, nestedOK := nestedFieldCopies(srcField.Type(), dstField.Type(), "from."+srcField.Name(), dstField.Name(), currentPkg)
+			if !nestedOK {
+				return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s cannot assign %s to %s",
+					typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), typeKey(srcField.Type()), typeKey(dstField.Type()))
+			}
+			pair.fields = append(pair.fields, fieldCopy{
+				srcName:     srcField.Name(),
+				srcExpr:     "from." + srcField.Name(),
+				dstName:     dstField.Name(),
+				flags:       flags,
+				zeroExpr:    zeroExpr(srcField.Type(), "from."+srcField.Name()),
+				nilSafe:     true,
+				zeroAssign:  fmt.Sprintf("copierGenZero[%s]()", typeString(dstField.Type(), currentPkg)),
+				nested:      nested,
+				importTypes: []types.Type{dstField.Type()},
+			})
+			continue
 		}
 
 		pair.fields = append(pair.fields, fieldCopy{
 			srcName:     srcField.Name(),
+			srcExpr:     "from." + srcField.Name(),
 			dstName:     dstField.Name(),
 			flags:       flags,
 			zeroExpr:    zeroExpr(srcField.Type(), "from."+srcField.Name()),
-			assignExpr:  assign,
+			assignExpr:  assign.expr,
+			nilSafe:     assign.nilSafe,
+			zeroAssign:  assign.zeroAssign,
 			insensitive: insensitive,
+			importTypes: []types.Type{srcField.Type(), dstField.Type()},
 		})
 	}
 
 	return pair, nil
+}
+
+func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg string) ([]fieldCopy, bool) {
+	ptr, ok := src.(*types.Pointer)
+	if !ok {
+		return nil, false
+	}
+	srcStruct, ok := structType(ptr.Elem())
+	if !ok {
+		return nil, false
+	}
+	dstStruct, ok := structType(dst)
+	if !ok {
+		return nil, false
+	}
+
+	var fields []fieldCopy
+	for i := 0; i < dstStruct.NumFields(); i++ {
+		dstField := dstStruct.Field(i)
+		if !dstField.Exported() {
+			continue
+		}
+		srcField, _, ok := findField(srcStruct, dstField.Name())
+		if !ok {
+			continue
+		}
+		source := srcExpr + "." + srcField.Name()
+		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), source, currentPkg)
+		if !ok {
+			return nil, false
+		}
+		fields = append(fields, fieldCopy{
+			srcName:     srcField.Name(),
+			srcExpr:     source,
+			dstName:     dstPrefix + "." + dstField.Name(),
+			flags:       0,
+			zeroExpr:    zeroExpr(srcField.Type(), source),
+			assignExpr:  assign.expr,
+			nilSafe:     assign.nilSafe,
+			zeroAssign:  assign.zeroAssign,
+			importTypes: []types.Type{srcField.Type(), dstField.Type()},
+		})
+	}
+	return fields, len(fields) > 0
+}
+
+func structType(t types.Type) (*types.Struct, bool) {
+	if named, ok := t.(*types.Named); ok {
+		t = named.Underlying()
+	}
+	st, ok := t.(*types.Struct)
+	return st, ok
 }
 
 func lookupStruct(pkg *types.Package, name string) (*types.Named, *types.Struct, error) {
@@ -520,14 +791,38 @@ func findField(st *types.Struct, name string) (*types.Var, bool, bool) {
 	return nil, false, false
 }
 
-func assignmentExpr(src, dst types.Type, srcExpr string, currentPkg string) (string, bool) {
+type assignment struct {
+	expr       string
+	nilSafe    bool
+	zeroAssign string
+}
+
+func assignmentExpr(src, dst types.Type, srcExpr string, currentPkg string) (assignment, bool) {
 	if types.AssignableTo(src, dst) {
-		return srcExpr, true
+		return assignment{expr: srcExpr}, true
 	}
 	if types.ConvertibleTo(src, dst) {
-		return fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), srcExpr), true
+		return assignment{expr: fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), srcExpr)}, true
 	}
-	return "", false
+	if ptr, ok := src.(*types.Pointer); ok {
+		elem := ptr.Elem()
+		deref := "*" + srcExpr
+		if types.AssignableTo(elem, dst) {
+			return assignment{
+				expr:       deref,
+				nilSafe:    true,
+				zeroAssign: fmt.Sprintf("copierGenZero[%s]()", typeString(dst, currentPkg)),
+			}, true
+		}
+		if types.ConvertibleTo(elem, dst) {
+			return assignment{
+				expr:       fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), deref),
+				nilSafe:    true,
+				zeroAssign: fmt.Sprintf("copierGenZero[%s]()", typeString(dst, currentPkg)),
+			}, true
+		}
+	}
+	return assignment{}, false
 }
 
 func zeroExpr(t types.Type, expr string) string {
@@ -557,6 +852,7 @@ func render(m model) ([]byte, error) {
 	fmt.Fprintf(&b, "// Code generated by copier-gen; DO NOT EDIT.\n\n")
 	renderImports(&b, imports)
 	fmt.Fprintln(&b, "func copierGenIsZero[T comparable](v T) bool { var zero T; return v == zero }")
+	fmt.Fprintln(&b, "func copierGenZero[T any]() T { var zero T; return zero }")
 	fmt.Fprintln(&b)
 
 	for _, pair := range m.pairs {
@@ -576,10 +872,19 @@ func collectImports(m model) map[string]string {
 		collectTypeImports(imports, pair.srcType, m.pkgPath)
 		collectTypeImports(imports, pair.dstType, m.pkgPath)
 		for _, field := range pair.fields {
-			_ = field
+			collectFieldImports(imports, field, m.pkgPath)
 		}
 	}
 	return imports
+}
+
+func collectFieldImports(imports map[string]string, field fieldCopy, currentPkg string) {
+	for _, t := range field.importTypes {
+		collectTypeImports(imports, t, currentPkg)
+	}
+	for _, nested := range field.nested {
+		collectFieldImports(imports, nested, currentPkg)
+	}
 }
 
 func collectTypeImports(imports map[string]string, t types.Type, currentPkg string) {
@@ -646,15 +951,7 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 		fmt.Fprintln(b, "if from == nil { return copier.ErrInvalidCopyFrom }")
 	}
 	for _, field := range pair.fields {
-		if field.insensitive {
-			fmt.Fprintln(b, "if !opt.CaseSensitive {")
-		}
-		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
-		fmt.Fprintln(b, "}")
-		if field.insensitive {
-			fmt.Fprintln(b, "}")
-		}
+		renderFieldCopy(b, field)
 	}
 	fmt.Fprintln(b, "return nil")
 	fmt.Fprintln(b, "}")
@@ -683,6 +980,34 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	fmt.Fprintln(b, "}")
 	fmt.Fprintln(b, "}")
 	fmt.Fprintln(b)
+}
+
+func renderFieldCopy(b *bytes.Buffer, field fieldCopy) {
+	if field.insensitive {
+		fmt.Fprintln(b, "if !opt.CaseSensitive {")
+	}
+	if len(field.nested) > 0 {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		for _, nested := range field.nested {
+			renderFieldCopy(b, nested)
+		}
+		fmt.Fprintf(b, "} else if !copier.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		fmt.Fprintln(b, "}")
+	} else if field.nilSafe {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
+		fmt.Fprintf(b, "} else if !copier.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		fmt.Fprintln(b, "}")
+	} else {
+		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
+		fmt.Fprintln(b, "}")
+	}
+	if field.insensitive {
+		fmt.Fprintln(b, "}")
+	}
 }
 
 func lowerFirst(s string) string {

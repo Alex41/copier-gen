@@ -171,3 +171,134 @@ func Cast(src User) (Employee, error) {
 		t.Fatalf("error does not name unsupported tag: %v", err)
 	}
 }
+
+func TestLoadModelDetectsAddressedSelectorDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string
+}
+
+type Wrapper struct {
+	Destination Destination
+}
+
+func Cast(src Source) error {
+	wrapper := &Wrapper{}
+	return copier.CopyWithOption(&wrapper.Destination, src, copier.Option{})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.pairs) != 1 {
+		t.Fatalf("expected one discovered pair, got %d", len(m.pairs))
+	}
+	if m.pairs[0].dstName != "Destination" {
+		t.Fatalf("expected Destination mapper, got %s", m.pairs[0].dstName)
+	}
+}
+
+func TestRenderPointerSourceToValueDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Enabled *bool
+}
+
+type Destination struct {
+	Enabled bool
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.CopyWithOption(dst, src, copier.Option{IgnoreEmpty: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Enabled != nil",
+		"to.Enabled = *from.Enabled",
+		"to.Enabled = copierGenZero[bool]()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderNestedPointerStructToValueStruct(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Notifications[T bool | *bool] struct {
+	Email T
+	Push T
+}
+
+type Source struct {
+	Notifications *Notifications[*bool]
+}
+
+type Destination struct {
+	Notifications Notifications[bool]
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.CopyWithOption(dst, src, copier.Option{IgnoreEmpty: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Notifications != nil",
+		"if from.Notifications.Email != nil",
+		"to.Notifications.Email = *from.Notifications.Email",
+		"to.Notifications = copierGenZero[Notifications[bool]]()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
