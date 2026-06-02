@@ -11,7 +11,7 @@ func TestRenderStructPairWithTags(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
 
-import copier "github.com/jinzhu/copier"
+import copier "github.com/Alex41/copier-gen"
 
 type User struct {
 	Name string
@@ -19,6 +19,7 @@ type User struct {
 	Skip string
 	alias string
 	Title string
+	Required string
 }
 
 type Employee struct {
@@ -55,7 +56,7 @@ func Cast(src User) (Employee, error) {
 		"to.Years = from.Age",
 		"if !opt.CaseSensitive",
 		"to.TITLE = from.Title",
-		"copier.CheckMust(\"Required\", employeeRequiredFlagsState)",
+		"to.Required = from.Required",
 		"copier.RegisterMapper(func(toValue interface{}, fromValue interface{}, opt copier.Option) (bool, error)",
 		"func NewCopySampleUserToSampleEmployeeConverter() copier.Converter[User, Employee]",
 	} {
@@ -65,5 +66,42 @@ func Cast(src User) (Employee, error) {
 	}
 	if strings.Contains(text, "to.Secret") {
 		t.Fatalf("ignored field was generated:\n%s", text)
+	}
+	if strings.Contains(text, "CheckMust") {
+		t.Fatalf("runtime must check was generated:\n%s", text)
+	}
+}
+
+func TestLoadModelFailsWhenMapperCannotBeGenerated(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type User struct {
+	Name string
+}
+
+type Employee struct {
+	Name string
+	Required string ` + "`copier:\"must\"`" + `
+}
+
+func Cast(src User) (Employee, error) {
+	var dst Employee
+	err := copier.CopyWithOption(&dst, src, copier.Option{})
+	return dst, err
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadModel(dir, nil)
+	if err == nil {
+		t.Fatal("loadModel succeeded for an incomplete mapper")
+	}
+	if !strings.Contains(err.Error(), "Required") {
+		t.Fatalf("error does not name the missing field: %v", err)
 	}
 }

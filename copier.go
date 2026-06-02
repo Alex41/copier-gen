@@ -1,17 +1,11 @@
 package copier
 
-import (
-	"fmt"
-	"sync"
-)
+import "sync"
 
 // These flags are used by generated files to preserve copier tag semantics.
 const (
-	tagMust uint8 = 1 << iota
-	tagNoPanic
-	tagIgnore
+	tagIgnore uint8 = 1 << iota
 	tagOverride
-	hasCopied
 
 	// Default values kept for source compatibility with old examples.
 	String  string  = ""
@@ -26,8 +20,6 @@ type Option struct {
 	IgnoreEmpty   bool
 	CaseSensitive bool
 	DeepCopy      bool
-	Must          bool
-	NoPanic       bool
 }
 
 // Converter is a typed conversion hook. It intentionally has no SrcType/DstType
@@ -55,37 +47,9 @@ func Convert[S, D any](src S, converter Converter[S, D]) (D, error) {
 	return converter(src)
 }
 
-// CheckMust is called by generated code after a copy routine completes.
-func CheckMust(field string, flags uint8) error {
-	if flags&hasCopied != 0 || flags&tagMust == 0 {
-		return nil
-	}
-	if flags&tagNoPanic != 0 {
-		return fmt.Errorf("field %s has must tag but was not copied", field)
-	}
-	panic(fmt.Sprintf("Field %s has must tag but was not copied", field))
-}
-
-// FieldFlags returns the effective flags for a generated destination field.
-func FieldFlags(tagFlags uint8, opt Option) uint8 {
-	flags := tagFlags
-	if opt.Must {
-		flags |= tagMust
-	}
-	if opt.NoPanic {
-		flags |= tagNoPanic
-	}
-	return flags
-}
-
 // ShouldIgnoreEmpty mirrors copier:"override" behavior for generated code.
 func ShouldIgnoreEmpty(isZero bool, flags uint8, opt Option) bool {
 	return opt.IgnoreEmpty && flags&tagOverride == 0 && isZero
-}
-
-// MarkCopied marks a generated field as successfully copied.
-func MarkCopied(flags uint8) uint8 {
-	return flags | hasCopied
 }
 
 // Copy dispatches to generated typed mappers. It does not use reflection.

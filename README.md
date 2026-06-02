@@ -9,7 +9,7 @@ Add a generator directive to a package that currently calls `copier.Copy` or
 `copier.CopyWithOption`:
 
 ```go
-//go:generate go run github.com/jinzhu/copier/cmd/copier-gen
+//go:generate go run github.com/Alex41/copier-gen/cmd/copier-gen
 ```
 
 Run:
@@ -33,7 +33,7 @@ ordinary Go type assertions. No reflection is used.
 Explicit pairs are still available for tests or manual generation:
 
 ```sh
-go run github.com/jinzhu/copier/cmd/copier-gen -pair User:Employee
+go run github.com/Alex41/copier-gen/cmd/copier-gen -pair User:Employee
 ```
 
 ## Generic Converters
@@ -56,8 +56,8 @@ Generated code supports the copier tags:
 | Tag | Behavior |
 | --- | --- |
 | `copier:"-"` | Ignore destination field. |
-| `copier:"must"` | Panic when the field is not copied. |
-| `copier:"must,nopanic"` | Return an error when the field is not copied. |
+| `copier:"must"` | Require the mapper to be generated for this field; generation fails if it cannot be mapped. |
+| `copier:"must,nopanic"` | Accepted for old tag compatibility; validation still happens during generation, not runtime. |
 | `copier:"override"` | Copy zero values even with `IgnoreEmpty`. |
 | `copier:"OtherName"` | Map fields by explicit name. |
 
@@ -67,8 +67,6 @@ Supported options:
 | --- | --- |
 | `IgnoreEmpty` | Skip zero source values unless the destination field has `override`. |
 | `CaseSensitive` | Disable generated case-insensitive fallback matches. |
-| `Must` | Treat all destination fields as `must`. |
-| `NoPanic` | Convert `must` panic into an error. |
 
 `DeepCopy` is reserved in `Option`; nested copy generation is the next step.
 

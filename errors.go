@@ -8,6 +8,5 @@ var (
 	ErrMapKeyNotMatch                = errors.New("map's key type doesn't match")
 	ErrNotSupported                  = errors.New("not supported")
 	ErrFieldNameTagStartNotUpperCase = errors.New("copier field name tag must be start upper case")
-	ErrRuntimeReflectionDisabled     = errors.New("runtime reflection copy is disabled; run copier-gen and call the generated typed copier")
 	ErrGeneratedMapperNotFound       = errors.New("generated mapper not found; run copier-gen for this package")
 )

@@ -51,31 +51,22 @@ type copyPair struct {
 	dst          *types.Struct
 	fromPtr      bool
 	fields       []fieldCopy
-	checks       []mustCheck
 	discoveredAt string
 }
 
 type fieldCopy struct {
 	srcName     string
 	dstName     string
-	dstFlagName string
 	flags       uint8
 	zeroExpr    string
 	assignExpr  string
 	insensitive bool
 }
 
-type mustCheck struct {
-	fieldName string
-	flagName  string
-	flags     uint8
-}
-
 const (
-	tagMust uint8 = 1 << iota
-	tagNoPanic
-	tagIgnore
+	tagIgnore uint8 = 1 << iota
 	tagOverride
+	tagMust
 )
 
 func main() {
@@ -316,8 +307,14 @@ func buildPair(pkg *types.Package, srcName, dstName string) (copyPair, error) {
 }
 
 func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
-	srcTags := structTags(pair.src)
-	dstTags := structTags(pair.dst)
+	srcTags, err := structTags(pair.src)
+	if err != nil {
+		return copyPair{}, err
+	}
+	dstTags, err := structTags(pair.dst)
+	if err != nil {
+		return copyPair{}, err
+	}
 
 	for i := 0; i < pair.dst.NumFields(); i++ {
 		dstField := pair.dst.Field(i)
@@ -326,8 +323,6 @@ func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
 		}
 		dstTag := dstTags[dstField.Name()]
 		flags := dstTag.flags
-		flagName := fmt.Sprintf("%s%sFlags", lowerFirst(pair.dstName), dstField.Name())
-		pair.checks = append(pair.checks, mustCheck{fieldName: dstField.Name(), flagName: flagName, flags: flags})
 		if flags&tagIgnore != 0 {
 			continue
 		}
@@ -335,18 +330,19 @@ func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
 		srcFieldName := sourceNameFor(dstField.Name(), dstTag.name, srcTags)
 		srcField, insensitive, ok := findField(pair.src, srcFieldName)
 		if !ok {
-			continue
+			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: destination field %s has no source field %s",
+				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), srcFieldName)
 		}
 
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), "from."+srcField.Name(), currentPkg)
 		if !ok {
-			continue
+			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s cannot assign %s to %s",
+				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), typeKey(srcField.Type()), typeKey(dstField.Type()))
 		}
 
 		pair.fields = append(pair.fields, fieldCopy{
 			srcName:     srcField.Name(),
 			dstName:     dstField.Name(),
-			dstFlagName: flagName,
 			flags:       flags,
 			zeroExpr:    zeroExpr(srcField.Type(), "from."+srcField.Name()),
 			assignExpr:  assign,
@@ -378,7 +374,7 @@ type tagInfo struct {
 	name  string
 }
 
-func structTags(st *types.Struct) map[string]tagInfo {
+func structTags(st *types.Struct) (map[string]tagInfo, error) {
 	result := map[string]tagInfo{}
 	for i := 0; i < st.NumFields(); i++ {
 		field := st.Field(i)
@@ -386,10 +382,13 @@ func structTags(st *types.Struct) map[string]tagInfo {
 			continue
 		}
 		tag := reflect.StructTag(st.Tag(i)).Get("copier")
-		info, _ := parseTag(tag)
+		info, err := parseTag(tag)
+		if err != nil {
+			return nil, fmt.Errorf("field %s: %w", field.Name(), err)
+		}
 		result[field.Name()] = info
 	}
-	return result
+	return result, nil
 }
 
 func parseTag(tag string) (tagInfo, error) {
@@ -407,8 +406,6 @@ func parseTag(tag string) (tagInfo, error) {
 			return info, nil
 		case "must":
 			info.flags |= tagMust
-		case "nopanic":
-			info.flags |= tagNoPanic
 		case "override":
 			info.flags |= tagOverride
 		default:
@@ -512,7 +509,7 @@ func render(m model) ([]byte, error) {
 }
 
 func collectImports(m model) map[string]string {
-	imports := map[string]string{"github.com/jinzhu/copier": "copier"}
+	imports := map[string]string{"github.com/Alex41/copier-gen": "copier"}
 	for _, pair := range m.pairs {
 		collectTypeImports(imports, pair.srcType, m.pkgPath)
 		collectTypeImports(imports, pair.dstType, m.pkgPath)
@@ -567,17 +564,9 @@ func uniqueImportName(imports map[string]string, base string) string {
 }
 
 func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
-	sort.Slice(pair.checks, func(i, j int) bool {
-		return pair.checks[i].fieldName < pair.checks[j].fieldName
-	})
 	sort.Slice(pair.fields, func(i, j int) bool {
 		return pair.fields[i].dstName < pair.fields[j].dstName
 	})
-
-	for _, check := range pair.checks {
-		fmt.Fprintf(b, "const %s uint8 = %d\n", check.flagName, check.flags)
-	}
-	fmt.Fprintln(b)
 
 	fn := mapperName(pair)
 	dstType := typeString(pair.dstType, currentPkg)
@@ -594,23 +583,16 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	if pair.fromPtr {
 		fmt.Fprintln(b, "if from == nil { return copier.ErrInvalidCopyFrom }")
 	}
-	for _, check := range pair.checks {
-		fmt.Fprintf(b, "%s := copier.FieldFlags(%s, opt)\n", check.flagName+"State", check.flagName)
-	}
 	for _, field := range pair.fields {
 		if field.insensitive {
 			fmt.Fprintln(b, "if !opt.CaseSensitive {")
 		}
-		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %s, opt) {\n", field.zeroExpr, field.dstFlagName+"State")
+		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
-		fmt.Fprintf(b, "%s = copier.MarkCopied(%s)\n", field.dstFlagName+"State", field.dstFlagName+"State")
 		fmt.Fprintln(b, "}")
 		if field.insensitive {
 			fmt.Fprintln(b, "}")
 		}
-	}
-	for _, check := range pair.checks {
-		fmt.Fprintf(b, "if err := copier.CheckMust(%q, %s); err != nil { return err }\n", check.fieldName, check.flagName+"State")
 	}
 	fmt.Fprintln(b, "return nil")
 	fmt.Fprintln(b, "}")
