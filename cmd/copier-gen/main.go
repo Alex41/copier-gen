@@ -40,6 +40,7 @@ type model struct {
 	pkgPath string
 	pairs   []copyPair
 	imports map[string]string
+	issues  []string
 }
 
 type copyPair struct {
@@ -81,6 +82,9 @@ func main() {
 		fatalf("%v", err)
 	}
 	if len(m.pairs) == 0 {
+		if len(m.issues) > 0 {
+			fatalf("found copier calls, but could not generate mappers:\n%s", strings.Join(m.issues, "\n"))
+		}
 		fatalf("no copier.Copy or copier.CopyWithOption calls found; pass -pair Src:Dst for an explicit mapper")
 	}
 
@@ -100,7 +104,15 @@ func main() {
 
 func loadModel(dir string, rawPairs []string) (model, error) {
 	if m, err := loadModelPackages(dir, rawPairs); err == nil {
-		return m, nil
+		if len(m.pairs) > 0 || len(rawPairs) > 0 {
+			return m, nil
+		}
+		fallback, fallbackErr := loadModelStd(dir, rawPairs)
+		if fallbackErr != nil {
+			return fallback, fallbackErr
+		}
+		fallback.issues = append(m.issues, fallback.issues...)
+		return fallback, nil
 	}
 	return loadModelStd(dir, rawPairs)
 }
@@ -125,8 +137,13 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 	}
 	pkg := pkgs[0]
 	m := model{pkgName: pkg.Name, pkgPath: pkg.PkgPath, imports: map[string]string{}}
+	for _, err := range pkg.Errors {
+		m.issues = append(m.issues, err.Error())
+	}
 	seen := map[string]bool{}
-	for _, pair := range discoverCopyPairs(pkg.Fset, pkg.Syntax, pkg.TypesInfo, pkg.Types) {
+	discovered, issues := discoverCopyPairs(pkg.Fset, pkg.Syntax, pkg.TypesInfo, pkg.Types)
+	m.issues = append(m.issues, issues...)
+	for _, pair := range discovered {
 		key := typeKey(pair.srcType) + "->" + typeKey(pair.dstType)
 		if seen[key] {
 			continue
@@ -192,7 +209,9 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 
 	m := model{pkgName: pkg.Name(), pkgPath: pkg.Path(), imports: map[string]string{}}
 	seen := map[string]bool{}
-	for _, pair := range discoverCopyPairs(fset, files, info, pkg) {
+	discovered, issues := discoverCopyPairs(fset, files, info, pkg)
+	m.issues = append(m.issues, issues...)
+	for _, pair := range discovered {
 		key := typeKey(pair.srcType) + "->" + typeKey(pair.dstType)
 		if seen[key] {
 			continue
@@ -220,28 +239,32 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 	return m, nil
 }
 
-func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info, pkg *types.Package) []copyPair {
+func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info, pkg *types.Package) ([]copyPair, []string) {
 	var pairs []copyPair
+	var issues []string
 	for _, file := range files {
 		ast.Inspect(file, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
 			if !ok || len(call.Args) < 2 {
 				return true
 			}
-			if !isCopierCall(call) {
+			if !isCopierCall(file, call, info) {
 				return true
 			}
+			pos := fset.Position(call.Lparen)
+			location := fmt.Sprintf("%s:%d", filepath.Base(pos.Filename), pos.Line)
 			dstType := info.TypeOf(call.Args[0])
 			srcType := info.TypeOf(call.Args[1])
 			dstNamed, _, ok := namedStructFromCopyArg(dstType)
 			if !ok {
+				issues = append(issues, fmt.Sprintf("%s: destination argument is not a pointer to named struct: %s", location, typeKeyOrUnknown(dstType)))
 				return true
 			}
 			srcNamed, fromPtr, ok := namedStructFromCopyArg(srcType)
 			if !ok {
+				issues = append(issues, fmt.Sprintf("%s: source argument is not a named struct or pointer to named struct: %s", location, typeKeyOrUnknown(srcType)))
 				return true
 			}
-			pos := fset.Position(call.Lparen)
 			pairs = append(pairs, copyPair{
 				srcName:      srcNamed.Obj().Name(),
 				dstName:      dstNamed.Obj().Name(),
@@ -256,10 +279,17 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 			return true
 		})
 	}
-	return pairs
+	return pairs, issues
 }
 
-func isCopierCall(call *ast.CallExpr) bool {
+func typeKeyOrUnknown(t types.Type) string {
+	if t == nil {
+		return "<unknown>"
+	}
+	return typeKey(t)
+}
+
+func isCopierCall(file *ast.File, call *ast.CallExpr, info *types.Info) bool {
 	sel, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
 		return false
@@ -268,7 +298,36 @@ func isCopierCall(call *ast.CallExpr) bool {
 		return false
 	}
 	ident, ok := sel.X.(*ast.Ident)
-	return ok && ident.Name == "copier"
+	if !ok {
+		return false
+	}
+	if info != nil {
+		if pkgName, ok := info.Uses[ident].(*types.PkgName); ok {
+			return isCopierImportPath(pkgName.Imported().Path())
+		}
+	}
+	return copierImportAliases(file)[ident.Name]
+}
+
+func copierImportAliases(file *ast.File) map[string]bool {
+	aliases := map[string]bool{}
+	for _, imp := range file.Imports {
+		path := strings.Trim(imp.Path.Value, `"`)
+		if !isCopierImportPath(path) {
+			continue
+		}
+		switch {
+		case imp.Name != nil:
+			aliases[imp.Name.Name] = true
+		default:
+			aliases["copier"] = true
+		}
+	}
+	return aliases
+}
+
+func isCopierImportPath(path string) bool {
+	return path == "github.com/Alex41/copier-gen"
 }
 
 func namedStructFromCopyArg(t types.Type) (*types.Named, bool, bool) {
@@ -330,6 +389,9 @@ func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
 		srcFieldName := sourceNameFor(dstField.Name(), dstTag.name, srcTags)
 		srcField, insensitive, ok := findField(pair.src, srcFieldName)
 		if !ok {
+			if flags&tagMust == 0 {
+				continue
+			}
 			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: destination field %s has no source field %s",
 				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), srcFieldName)
 		}

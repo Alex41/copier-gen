@@ -57,7 +57,6 @@ Generated code supports the copier tags:
 | --- | --- |
 | `copier:"-"` | Ignore destination field. |
 | `copier:"must"` | Require the mapper to be generated for this field; generation fails if it cannot be mapped. |
-| `copier:"must,nopanic"` | Accepted for old tag compatibility; validation still happens during generation, not runtime. |
 | `copier:"override"` | Copy zero values even with `IgnoreEmpty`. |
 | `copier:"OtherName"` | Map fields by explicit name. |
 
