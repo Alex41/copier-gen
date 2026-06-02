@@ -1,341 +1,94 @@
-# Copier
+# copier-gen
 
-I am a copier, I copy everything from one to another
+`copier-gen` generates typed copy functions before build/commit time. Runtime
+reflection copying is disabled; call generated functions instead.
 
-[![test status](https://github.com/jinzhu/copier/workflows/tests/badge.svg?branch=master "test status")](https://github.com/jinzhu/copier/actions)
+## Usage
 
-## Key Features
-
-- Field-to-field and method-to-field copying based on matching names
-- Support for copying data:
-  - From slice to slice
-  - From struct to slice
-  - From map to map
-- Field manipulation through tags:
-  - Enforce field copying with `copier:"must"`
-  - Override fields even when `IgnoreEmpty` is set with `copier:"override"`
-  - Exclude fields from being copied with `copier:"-"`
-
-## Getting Started
-
-### Installation
-
-To start using Copier, install Go and run go get:
-
-```bash
-go get -u github.com/jinzhu/copier
-```
-
-## Basic
-
-Import Copier into your application to access its copying capabilities
+Add a generator directive to a package that currently calls `copier.Copy` or
+`copier.CopyWithOption`:
 
 ```go
-import "github.com/jinzhu/copier"
+//go:generate go run github.com/jinzhu/copier/cmd/copier-gen
 ```
 
-### Basic Copying
+Run:
+
+```sh
+go generate ./...
+```
+
+The generator scans call sites, infers the concrete source and destination
+types, writes `copier_gen.go`, and creates:
 
 ```go
-type User struct {
-	Name string
-	Role string
-	Age  int32
-}
-
-func (user *User) DoubleAge() int32 {
-	return 2 * user.Age
-}
-
-type Employee struct {
-	Name      string
-	Age       int32
-	DoubleAge int32
-	SuperRole string
-}
-
-func (employee *Employee) Role(role string) {
-	employee.SuperRole = "Super " + role
-}
-
-func main() {
-	user := User{Name: "Jinzhu", Age: 18, Role: "Admin"}
-	employee := Employee{}
-
-	copier.Copy(&employee, &user)
-	fmt.Printf("%#v\n", employee)
-	// Output: Employee{Name:"Jinzhu", Age:18, DoubleAge:36, SuperRole:"Super Admin"}
-}
+func CopyUserToEmployee(to *Employee, from User, opt copier.Option) error
+func NewUserToEmployeeConverter() copier.Converter[User, Employee]
 ```
 
-## Tag Usage Examples
+Generated files also register a mapper in `init()`. Existing calls such as
+`copier.CopyWithOption(&dst, src, opt)` dispatch to that generated mapper using
+ordinary Go type assertions. No reflection is used.
 
-### `copier:"-"` - Ignoring Fields
+Explicit pairs are still available for tests or manual generation:
 
-Fields tagged with `copier:"-"` are explicitly ignored by Copier during the copying process.
+```sh
+go run github.com/jinzhu/copier/cmd/copier-gen -pair User:Employee
+```
+
+## Generic Converters
+
+Converters are typed by generics. There are no `SrcType` or `DstType` marker
+fields.
 
 ```go
-type Source struct {
-    Name   string
-    Secret string // We do not want this to be copied.
-}
-
-type Target struct {
-    Name   string
-    Secret string `copier:"-"`
-}
-
-func main() {
-    source := Source{Name: "John", Secret: "so_secret"}
-    target := Target{}
-
-    copier.Copy(&target, &source)
-    fmt.Printf("Name: %s, Secret: '%s'\n", target.Name, target.Secret)
-    // Output: Name: John, Secret: ''
-}
+converter := copier.Converter[User, Employee](func(src User) (Employee, error) {
+	var dst Employee
+	err := CopyUserToEmployee(&dst, src, copier.Option{})
+	return dst, err
+})
 ```
 
-### `copier:"must"` - Enforcing Field Copy
+## Tags And Options
 
-The `copier:"must"` tag forces a field to be copied, resulting in a panic or an error if the field cannot be copied.
+Generated code supports the copier tags:
 
-```go
-type MandatorySource struct {
-	Identification int
-}
+| Tag | Behavior |
+| --- | --- |
+| `copier:"-"` | Ignore destination field. |
+| `copier:"must"` | Panic when the field is not copied. |
+| `copier:"must,nopanic"` | Return an error when the field is not copied. |
+| `copier:"override"` | Copy zero values even with `IgnoreEmpty`. |
+| `copier:"OtherName"` | Map fields by explicit name. |
 
-type MandatoryTarget struct {
-	ID int `copier:"must"` // This field must be copied, or it will panic/error.
-}
+Supported options:
 
-func main() {
-	source := MandatorySource{}
-	target := MandatoryTarget{ID: 10}
+| Option | Behavior |
+| --- | --- |
+| `IgnoreEmpty` | Skip zero source values unless the destination field has `override`. |
+| `CaseSensitive` | Disable generated case-insensitive fallback matches. |
+| `Must` | Treat all destination fields as `must`. |
+| `NoPanic` | Convert `must` panic into an error. |
 
-	// This will result in a panic or an error since ID is a must field but is empty in source.
-	if err := copier.Copy(&target, &source); err != nil {
-		log.Fatal(err)
-	}
-}
-```
+`DeepCopy` is reserved in `Option`; nested copy generation is the next step.
 
-### `copier:"must,nopanic"` - Enforcing Field Copy Without Panic
+## Generator Scope
 
-Similar to `copier:"must"`, but Copier returns an error instead of panicking if the field is not copied.
+Current generator support is intentionally narrow and static:
 
-```go
-type SafeSource struct {
-	ID string
-}
+- same-package struct-to-struct pairs via `-pair Src:Dst`
+- automatic discovery of `copier.Copy` and `copier.CopyWithOption` call sites
+- exported fields
+- direct assignment or Go type conversion
+- registration-backed `Copy` / `CopyWithOption` dispatch without reflection
+- generated typed converter factory per pair
 
-type SafeTarget struct {
-	Code string `copier:"must,nopanic"` // Enforce copying without panic.
-}
+The extension point is the generator pipeline: new field handlers can be added
+where `assignmentExpr`, tag parsing, and pair rendering decide how a field is
+copied. That is where custom converters, nested structs, slices, maps, methods,
+SQL Scanner/Valuer support, and field-name mapping config should be added.
 
-func main() {
-	source := SafeSource{}
-	target := SafeTarget{Code: "200"}
-
-	if err := copier.Copy(&target, &source); err != nil {
-		log.Fatalln("Error:", err)
-	}
-	// This will not panic, but will return an error due to missing mandatory field.
-}
-```
-
-### `copier:"override"` - Overriding Fields with IgnoreEmpty
-
-Fields tagged with `copier:"override"` are copied even if IgnoreEmpty is set to true in Copier options and works for nil values.
-
-```go
-type SourceWithNil struct {
-    Details *string
-}
-
-type TargetOverride struct {
-    Details *string `copier:"override"` // Even if source is nil, copy it.
-}
-
-func main() {
-    details := "Important details"
-    source := SourceWithNil{Details: nil}
-    target := TargetOverride{Details: &details}
-
-    copier.CopyWithOption(&target, &source, copier.Option{IgnoreEmpty: true})
-    if target.Details == nil {
-        fmt.Println("Details field was overridden to nil.")
-    }
-}
-```
-
-### Specifying Custom Field Names
-
-Use field tags to specify a custom field name when the source and destination field names do not match.
-
-```go
-type SourceEmployee struct {
-    Identifier int64
-}
-
-type TargetWorker struct {
-    ID int64 `copier:"Identifier"` // Map Identifier from SourceEmployee to ID in TargetWorker
-}
-
-func main() {
-    source := SourceEmployee{Identifier: 1001}
-    target := TargetWorker{}
-
-    copier.Copy(&target, &source)
-    fmt.Printf("Worker ID: %d\n", target.ID)
-    // Output: Worker ID: 1001
-}
-```
-
-## Other examples
-
-### Copy from Method to Field with Same Name
-
-Illustrates copying from a method to a field and vice versa.
-
-```go
-// Assuming User and Employee structs defined earlier with method and field respectively.
-
-func main() {
-    user := User{Name: "Jinzhu", Age: 18}
-    employee := Employee{}
-
-    copier.Copy(&employee, &user)
-    fmt.Printf("DoubleAge: %d\n", employee.DoubleAge)
-    // Output: DoubleAge: 36, demonstrating method to field copying.
-}
-```
-
-### Copy Struct to Slice
-
-```go
-func main() {
-    user := User{Name: "Jinzhu", Age: 18, Role: "Admin"}
-    var employees []Employee
-
-    copier.Copy(&employees, &user)
-    fmt.Printf("%#v\n", employees)
-    // Output: []Employee{{Name: "Jinzhu", Age: 18, DoubleAge: 36, SuperRole: "Super Admin"}}
-}
-```
-
-### Copy Slice to Slice
-
-```go
-func main() {
-    users := []User{{Name: "Jinzhu", Age: 18, Role: "Admin"}, {Name: "jinzhu 2", Age: 30, Role: "Dev"}}
-    var employees []Employee
-
-    copier.Copy(&employees, &users)
-    fmt.Printf("%#v\n", employees)
-    // Output: []Employee{{Name: "Jinzhu", Age: 18, DoubleAge: 36, SuperRole: "Super Admin"}, {Name: "jinzhu 2", Age: 30, DoubleAge: 60, SuperRole: "Super Dev"}}
-}
-```
-
-### Copy Map to Map
-
-```go
-func main() {
-    map1 := map[int]int{3: 6, 4: 8}
-    map2 := map[int32]int8{}
-
-    copier.Copy(&map2, map1)
-    fmt.Printf("%#v\n", map2)
-    // Output: map[int32]int8{3:6, 4:8}
-}
-```
-
-## Complex Data Copying: Nested Structures with Slices
-
-This example demonstrates how Copier can be used to copy data involving complex, nested structures, including slices of structs, to showcase its ability to handle intricate data copying scenarios.
-
-```go
-package main
-
-import (
-	"fmt"
-	"github.com/jinzhu/copier"
-)
-
-type Address struct {
-	City    string
-	Country string
-}
-
-type Contact struct {
-	Email  string
-	Phones []string
-}
-
-type Employee struct {
-	Name      string
-	Age       int32
-	Addresses []Address
-	Contact   *Contact
-}
-
-type Manager struct {
-	Name            string `copier:"must"`
-	Age             int32  `copier:"must,nopanic"`
-	ManagedCities   []string
-	Contact         *Contact `copier:"override"`
-	SecondaryEmails []string
-}
-
-func main() {
-	employee := Employee{
-		Name: "John Doe",
-		Age:  30,
-		Addresses: []Address{
-			{City: "New York", Country: "USA"},
-			{City: "San Francisco", Country: "USA"},
-		},
-		Contact: nil,
-	}
-
-	manager := Manager{
-		ManagedCities: []string{"Los Angeles", "Boston"},
-		Contact: &Contact{
-			Email:  "john.doe@example.com",
-			Phones: []string{"123-456-7890", "098-765-4321"},
-		}, // since override is set this should be overridden with nil
-		SecondaryEmails: []string{"secondary@example.com"},
-	}
-
-	copier.CopyWithOption(&manager, &employee, copier.Option{IgnoreEmpty: true, DeepCopy: true})
-
-	fmt.Printf("Manager: %#v\n", manager)
-	// Output: Manager struct showcasing copied fields from Employee,
-	// including overridden and deeply copied nested slices.
-}
-```
-
-## Available tags
-
-| Tag                 | Description                                                                                                       |
-| ------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `copier:"-"`        | Explicitly ignores the field during copying.                                                                      |
-| `copier:"must"`     | Forces the field to be copied; Copier will panic or return an error if the field is not copied.                   |
-| `copier:"nopanic"`  | Copier will return an error instead of panicking.                                                                 |
-| `copier:"override"` | Forces the field to be copied even if `IgnoreEmpty` is set. Useful for overriding existing values with empty ones |
-| `FieldName`         | Specifies a custom field name for copying when field names do not match between structs.                          |
-
-## Contributing
-
-You can help to make the project better, check out [http://gorm.io/contribute.html](http://gorm.io/contribute.html) for things you can do.
-
-# Author
-
-**jinzhu**
-
-- <http://github.com/jinzhu>
-- <wosmvp@gmail.com>
-- <http://twitter.com/zhangjinzhu>
-
-## License
-
-Released under the [MIT License](https://github.com/jinzhu/copier/blob/master/License).
+Legacy inline `copier.TypeConverter{SrcType, DstType, Fn}` blocks are not kept
+as runtime converters. They should be migrated into generated typed converter
+handlers; this is the next required feature for full parity with old call sites
+that pass custom converters.
