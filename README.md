@@ -45,21 +45,20 @@ file.
 
 ## Generic Converters
 
-Converters are typed by generics. There are no `SrcType` or `DstType` marker
-fields.
+Converters are typed by generics and declared at generation time. There are no
+`SrcType` or `DstType` marker fields.
 
 ```go
-err := copier.CopyWithOption(&dst, src, copier.Option{
-	Converters: []any{
-		copier.Converter[RawStatus, FormattedStatus](func(src RawStatus) (FormattedStatus, error) {
-			return FormatStatus(src)
-		}),
-	},
-})
+func FormatStatus(src RawStatus) (FormattedStatus, error) {
+	return FormattedStatus{Value: src.Value}, nil
+}
+
+var _ = copier.UseConverter[RawStatus, FormattedStatus](FormatStatus)
 ```
 
-Generated code uses `copier.FindConverter[RawStatus, FormattedStatus](opt)` for
-fields that cannot be assigned or converted directly.
+Generated code calls `FormatStatus(from.Status)` directly for fields that
+cannot be assigned or converted directly. If the generator cannot find a
+matching `UseConverter[Src, Dst]` declaration, `go generate` fails.
 
 ## Tags And Options
 
@@ -98,4 +97,4 @@ copied. That is where custom converters, nested structs, slices, maps, methods,
 SQL Scanner/Valuer support, and field-name mapping config should be added.
 
 Legacy inline `copier.TypeConverter{SrcType, DstType, Fn}` blocks are not kept.
-Use typed `copier.Converter[Src, Dst]` values in `Option.Converters`.
+Use package-level `copier.UseConverter[Src, Dst](Fn)` declarations instead.

@@ -20,12 +20,17 @@ type Option struct {
 	IgnoreEmpty   bool
 	CaseSensitive bool
 	DeepCopy      bool
-	Converters    []any
 }
 
 // Converter is a typed conversion hook. It intentionally has no SrcType/DstType
 // fields: the Go type parameters are the contract.
 type Converter[S, D any] func(src S) (dst D, err error)
+
+// UseConverter marks a typed converter for copier-gen. Keep calls to this
+// function in package-level declarations so the generator can discover them.
+func UseConverter[S, D any](converter Converter[S, D]) Converter[S, D] {
+	return converter
+}
 
 // Mapper is registered by generated files. It must return handled=false when
 // the argument types do not match its generated mapper.
@@ -46,18 +51,6 @@ func RegisterMapper(mapper Mapper) {
 // Convert applies a typed converter.
 func Convert[S, D any](src S, converter Converter[S, D]) (D, error) {
 	return converter(src)
-}
-
-// FindConverter looks up a typed converter from options using ordinary type
-// assertions. Generated code uses it when a field cannot be assigned directly.
-func FindConverter[S, D any](opt Option) (Converter[S, D], bool) {
-	for _, converter := range opt.Converters {
-		typed, ok := converter.(Converter[S, D])
-		if ok {
-			return typed, true
-		}
-	}
-	return nil, false
 }
 
 // IsZero is used by generated files.

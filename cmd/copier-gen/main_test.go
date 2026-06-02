@@ -348,6 +348,12 @@ type Destination struct {
 	Status Formatted
 }
 
+func ConvertRaw(src Raw) (Formatted, error) {
+	return Formatted{Label: src.Value}, nil
+}
+
+var _ = copier.UseConverter[Raw, Formatted](ConvertRaw)
+
 func Cast(src Source) error {
 	dst := &Destination{}
 	return copier.CopyWithOption(dst, src, copier.Option{})
@@ -367,15 +373,52 @@ func Cast(src Source) error {
 	}
 	text := string(out)
 	for _, want := range []string{
-		"converter, ok := copier.FindConverter[Raw, Formatted](opt)",
-		"if !ok",
-		"return copier.ErrConverterNotFound",
-		"converted, err := converter(from.Status)",
+		"converted, err := ConvertRaw(from.Status)",
 		"to.Status = converted",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestLoadModelFailsWhenRequiredConverterIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Status Raw
+}
+
+type Destination struct {
+	Status Formatted
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.CopyWithOption(dst, src, copier.Option{})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadModel(dir, nil)
+	if err == nil {
+		t.Fatal("loadModel succeeded without required converter")
+	}
+	if !strings.Contains(err.Error(), "needs converter") {
+		t.Fatalf("error does not explain missing converter: %v", err)
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"go/format"
 	"go/importer"
 	"go/parser"
+	"go/printer"
 	"go/token"
 	"go/types"
 	"os"
@@ -37,11 +38,12 @@ func (p *pairFlag) Set(value string) error {
 }
 
 type model struct {
-	pkgName string
-	pkgPath string
-	pairs   []copyPair
-	imports map[string]string
-	issues  []string
+	pkgName    string
+	pkgPath    string
+	pairs      []copyPair
+	imports    map[string]string
+	issues     []string
+	converters map[string]staticConverter
 }
 
 type generationError struct {
@@ -78,8 +80,15 @@ type fieldCopy struct {
 	zeroAssign  string
 	nested      []fieldCopy
 	converter   bool
+	converterFn string
 	insensitive bool
 	importTypes []types.Type
+}
+
+type staticConverter struct {
+	srcType types.Type
+	dstType types.Type
+	fn      string
 }
 
 const (
@@ -150,10 +159,11 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 		return model{}, fmt.Errorf("package type information is unavailable")
 	}
 	pkg := pkgs[0]
-	m := model{pkgName: pkg.Name, pkgPath: pkg.PkgPath, imports: map[string]string{}}
+	m := model{pkgName: pkg.Name, pkgPath: pkg.PkgPath, imports: map[string]string{}, converters: map[string]staticConverter{}}
 	for _, err := range pkg.Errors {
 		m.issues = append(m.issues, err.Error())
 	}
+	m.converters = discoverStaticConverters(pkg.Fset, pkg.Syntax, pkg.TypesInfo)
 	seen := map[string]bool{}
 	discovered, issues := discoverCopyPairs(pkg.Fset, pkg.Syntax, pkg.TypesInfo, pkg.Types)
 	m.issues = append(m.issues, issues...)
@@ -163,7 +173,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 			continue
 		}
 		seen[key] = true
-		built, err := buildPairFromTypes(pair, pkg.PkgPath)
+		built, err := buildPairFromTypes(pair, pkg.PkgPath, m.converters)
 		if err != nil {
 			return model{}, generationError{err: err}
 		}
@@ -171,7 +181,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 	}
 	for _, raw := range rawPairs {
 		parts := strings.SplitN(raw, ":", 2)
-		pair, err := buildPair(pkg.Types, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		pair, err := buildPair(pkg.Types, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), m.converters)
 		if err != nil {
 			return model{}, err
 		}
@@ -221,7 +231,8 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 		return model{}, err
 	}
 
-	m := model{pkgName: pkg.Name(), pkgPath: pkg.Path(), imports: map[string]string{}}
+	m := model{pkgName: pkg.Name(), pkgPath: pkg.Path(), imports: map[string]string{}, converters: map[string]staticConverter{}}
+	m.converters = discoverStaticConverters(fset, files, info)
 	seen := map[string]bool{}
 	discovered, issues := discoverCopyPairs(fset, files, info, pkg)
 	m.issues = append(m.issues, issues...)
@@ -231,7 +242,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 			continue
 		}
 		seen[key] = true
-		built, err := buildPairFromTypes(pair, pkg.Path())
+		built, err := buildPairFromTypes(pair, pkg.Path(), m.converters)
 		if err != nil {
 			return model{}, err
 		}
@@ -240,7 +251,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 
 	for _, raw := range rawPairs {
 		parts := strings.SplitN(raw, ":", 2)
-		pair, err := buildPair(pkg, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+		pair, err := buildPair(pkg, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), m.converters)
 		if err != nil {
 			return model{}, err
 		}
@@ -297,6 +308,91 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 		})
 	}
 	return pairs, issues
+}
+
+func discoverStaticConverters(fset *token.FileSet, files []*ast.File, info *types.Info) map[string]staticConverter {
+	converters := map[string]staticConverter{}
+	for _, file := range files {
+		ast.Inspect(file, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || len(call.Args) != 1 {
+				return true
+			}
+			src, dst, ok := useConverterTypes(file, call, info)
+			if !ok {
+				return true
+			}
+			fn, ok := converterFunctionName(fset, call.Args[0])
+			if !ok {
+				return true
+			}
+			converters[converterKey(src, dst)] = staticConverter{
+				srcType: src,
+				dstType: dst,
+				fn:      fn,
+			}
+			return true
+		})
+	}
+	return converters
+}
+
+func useConverterTypes(file *ast.File, call *ast.CallExpr, info *types.Info) (types.Type, types.Type, bool) {
+	var fun ast.Expr
+	var typeArgs []ast.Expr
+	switch indexed := call.Fun.(type) {
+	case *ast.IndexListExpr:
+		fun = indexed.X
+		typeArgs = indexed.Indices
+	case *ast.IndexExpr:
+		fun = indexed.X
+		typeArgs = []ast.Expr{indexed.Index}
+	default:
+		return nil, nil, false
+	}
+	if len(typeArgs) != 2 {
+		return nil, nil, false
+	}
+	sel, ok := fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "UseConverter" {
+		return nil, nil, false
+	}
+	callLike := &ast.CallExpr{Fun: sel}
+	if !isCopierSelectorCall(file, callLike, info) {
+		return nil, nil, false
+	}
+	src := typeExprType(info, typeArgs[0])
+	dst := typeExprType(info, typeArgs[1])
+	if src == nil || dst == nil {
+		return nil, nil, false
+	}
+	return src, dst, true
+}
+
+func typeExprType(info *types.Info, expr ast.Expr) types.Type {
+	if info == nil {
+		return nil
+	}
+	if tv, ok := info.Types[expr]; ok && tv.Type != nil && !isInvalidType(tv.Type) {
+		return tv.Type
+	}
+	if t := info.TypeOf(expr); t != nil && !isInvalidType(t) {
+		return t
+	}
+	return nil
+}
+
+func converterFunctionName(fset *token.FileSet, expr ast.Expr) (string, bool) {
+	switch expr.(type) {
+	case *ast.Ident, *ast.SelectorExpr:
+	default:
+		return "", false
+	}
+	var b bytes.Buffer
+	if err := printer.Fprint(&b, fset, expr); err != nil {
+		return "", false
+	}
+	return b.String(), true
 }
 
 func typeKeyOrUnknown(t types.Type) string {
@@ -494,6 +590,14 @@ func isCopierCall(file *ast.File, call *ast.CallExpr, info *types.Info) bool {
 	if sel.Sel.Name != "Copy" && sel.Sel.Name != "CopyWithOption" {
 		return false
 	}
+	return isCopierSelectorCall(file, call, info)
+}
+
+func isCopierSelectorCall(file *ast.File, call *ast.CallExpr, info *types.Info) bool {
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
 	ident, ok := sel.X.(*ast.Ident)
 	if !ok {
 		return false
@@ -543,7 +647,7 @@ func namedStructFromCopyArg(t types.Type) (*types.Named, bool, bool) {
 	return nil, false, false
 }
 
-func buildPair(pkg *types.Package, srcName, dstName string) (copyPair, error) {
+func buildPair(pkg *types.Package, srcName, dstName string, converters map[string]staticConverter) (copyPair, error) {
 	srcNamed, srcStruct, err := lookupStruct(pkg, srcName)
 	if err != nil {
 		return copyPair{}, err
@@ -559,10 +663,10 @@ func buildPair(pkg *types.Package, srcName, dstName string) (copyPair, error) {
 		dstType: dstNamed,
 		src:     srcStruct,
 		dst:     dstStruct,
-	}, pkg.Path())
+	}, pkg.Path(), converters)
 }
 
-func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
+func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]staticConverter) (copyPair, error) {
 	srcTags, err := structTags(pair.src)
 	if err != nil {
 		return copyPair{}, err
@@ -597,6 +701,11 @@ func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
 		if !ok {
 			nested, nestedOK := nestedFieldCopies(srcField.Type(), dstField.Type(), "from."+srcField.Name(), dstField.Name(), currentPkg)
 			if !nestedOK {
+				converter, ok := converters[converterKey(srcField.Type(), dstField.Type())]
+				if !ok {
+					return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s needs converter %s -> %s",
+						typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), typeKey(srcField.Type()), typeKey(dstField.Type()))
+				}
 				pair.fields = append(pair.fields, fieldCopy{
 					srcName:     srcField.Name(),
 					srcExpr:     "from." + srcField.Name(),
@@ -606,6 +715,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string) (copyPair, error) {
 					flags:       flags,
 					zeroExpr:    zeroExpr(srcField.Type(), "from."+srcField.Name()),
 					converter:   true,
+					converterFn: converter.fn,
 					insensitive: insensitive,
 					importTypes: []types.Type{srcField.Type(), dstField.Type()},
 				})
@@ -1046,9 +1156,7 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 	}
 	if field.converter {
 		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
-		fmt.Fprintf(b, "converter, ok := copier.FindConverter[%s, %s](opt)\n", typeString(field.srcType, currentPkg), typeString(field.dstType, currentPkg))
-		fmt.Fprintln(b, "if !ok { return copier.ErrConverterNotFound }")
-		fmt.Fprintf(b, "converted, err := converter(%s)\n", field.srcExpr)
+		fmt.Fprintf(b, "converted, err := %s(%s)\n", field.converterFn, field.srcExpr)
 		fmt.Fprintln(b, "if err != nil { return err }")
 		fmt.Fprintf(b, "to.%s = converted\n", field.dstName)
 		fmt.Fprintln(b, "}")
@@ -1102,6 +1210,10 @@ func typeKey(t types.Type) string {
 		}
 		return pkg.Path()
 	})
+}
+
+func converterKey(src, dst types.Type) string {
+	return typeKey(src) + "->" + typeKey(dst)
 }
 
 func mapperName(pair copyPair) string {
