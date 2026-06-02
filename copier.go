@@ -20,6 +20,7 @@ type Option struct {
 	IgnoreEmpty   bool
 	CaseSensitive bool
 	DeepCopy      bool
+	Converters    []any
 }
 
 // Converter is a typed conversion hook. It intentionally has no SrcType/DstType
@@ -45,6 +46,30 @@ func RegisterMapper(mapper Mapper) {
 // Convert applies a typed converter.
 func Convert[S, D any](src S, converter Converter[S, D]) (D, error) {
 	return converter(src)
+}
+
+// FindConverter looks up a typed converter from options using ordinary type
+// assertions. Generated code uses it when a field cannot be assigned directly.
+func FindConverter[S, D any](opt Option) (Converter[S, D], bool) {
+	for _, converter := range opt.Converters {
+		typed, ok := converter.(Converter[S, D])
+		if ok {
+			return typed, true
+		}
+	}
+	return nil, false
+}
+
+// IsZero is used by generated files.
+func IsZero[T comparable](v T) bool {
+	var zero T
+	return v == zero
+}
+
+// Zero is used by generated files.
+func Zero[T any]() T {
+	var zero T
+	return zero
 }
 
 // ShouldIgnoreEmpty mirrors copier:"override" behavior for generated code.

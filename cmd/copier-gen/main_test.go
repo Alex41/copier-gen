@@ -1,6 +1,8 @@
 package main
 
 import (
+	"go/token"
+	"go/types"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,7 +248,7 @@ func Cast(src Source) error {
 	for _, want := range []string{
 		"if from.Enabled != nil",
 		"to.Enabled = *from.Enabled",
-		"to.Enabled = copierGenZero[bool]()",
+		"to.Enabled = copier.Zero[bool]()",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
@@ -295,10 +297,101 @@ func Cast(src Source) error {
 		"if from.Notifications != nil",
 		"if from.Notifications.Email != nil",
 		"to.Notifications.Email = *from.Notifications.Email",
-		"to.Notifications = copierGenZero[Notifications[bool]]()",
+		"to.Notifications = copier.Zero[Notifications[bool]]()",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestWriteGeneratedFilesUsesSourceFileNames(t *testing.T) {
+	dir := t.TempDir()
+	m := model{
+		pkgName: "sample",
+		pkgPath: "sample",
+		pairs: []copyPair{
+			minimalPair("ActivitySource", "ActivityDestination", "activity.go"),
+			minimalPair("UserProjectSource", "UserProjectDestination", "user_project.go"),
+		},
+	}
+
+	if err := writeGeneratedFiles(dir, "", m); err != nil {
+		t.Fatalf("writeGeneratedFiles returned error: %v", err)
+	}
+	for _, file := range []string{"activity_copier_gen.go", "user_project_copier_gen.go"} {
+		if _, err := os.Stat(filepath.Join(dir, file)); err != nil {
+			t.Fatalf("expected generated file %s: %v", file, err)
+		}
+	}
+}
+
+func TestRenderUsesTypedConverterForIncompatibleField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Status Raw
+}
+
+type Destination struct {
+	Status Formatted
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.CopyWithOption(dst, src, copier.Option{})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverter[Raw, Formatted](opt)",
+		"if !ok",
+		"return copier.ErrConverterNotFound",
+		"converted, err := converter(from.Status)",
+		"to.Status = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func minimalPair(srcName, dstName, sourceFile string) copyPair {
+	srcStruct := types.NewStruct(nil, nil)
+	dstStruct := types.NewStruct(nil, nil)
+	pkg := types.NewPackage("sample", "sample")
+	src := types.NewNamed(types.NewTypeName(token.NoPos, pkg, srcName, nil), srcStruct, nil)
+	dst := types.NewNamed(types.NewTypeName(token.NoPos, pkg, dstName, nil), dstStruct, nil)
+	return copyPair{
+		srcName:    srcName,
+		dstName:    dstName,
+		srcType:    src,
+		dstType:    dst,
+		src:        srcStruct,
+		dst:        dstStruct,
+		sourceFile: sourceFile,
 	}
 }

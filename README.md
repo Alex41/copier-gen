@@ -19,7 +19,11 @@ go generate ./...
 ```
 
 The generator scans call sites, infers the concrete source and destination
-types, writes `copier_gen.go`, and creates:
+types, writes generated files next to their source files, and creates:
+
+```text
+activity.go -> activity_copier_gen.go
+```
 
 ```go
 func CopyUserToEmployee(to *Employee, from User, opt copier.Option) error
@@ -36,18 +40,26 @@ Explicit pairs are still available for tests or manual generation:
 go run github.com/Alex41/copier-gen/cmd/copier-gen -pair User:Employee
 ```
 
+Use `-out some_file.go` only when you intentionally want one combined generated
+file.
+
 ## Generic Converters
 
 Converters are typed by generics. There are no `SrcType` or `DstType` marker
 fields.
 
 ```go
-converter := copier.Converter[User, Employee](func(src User) (Employee, error) {
-	var dst Employee
-	err := CopyUserToEmployee(&dst, src, copier.Option{})
-	return dst, err
+err := copier.CopyWithOption(&dst, src, copier.Option{
+	Converters: []any{
+		copier.Converter[RawStatus, FormattedStatus](func(src RawStatus) (FormattedStatus, error) {
+			return FormatStatus(src)
+		}),
+	},
 })
 ```
+
+Generated code uses `copier.FindConverter[RawStatus, FormattedStatus](opt)` for
+fields that cannot be assigned or converted directly.
 
 ## Tags And Options
 
@@ -85,7 +97,5 @@ where `assignmentExpr`, tag parsing, and pair rendering decide how a field is
 copied. That is where custom converters, nested structs, slices, maps, methods,
 SQL Scanner/Valuer support, and field-name mapping config should be added.
 
-Legacy inline `copier.TypeConverter{SrcType, DstType, Fn}` blocks are not kept
-as runtime converters. They should be migrated into generated typed converter
-handlers; this is the next required feature for full parity with old call sites
-that pass custom converters.
+Legacy inline `copier.TypeConverter{SrcType, DstType, Fn}` blocks are not kept.
+Use typed `copier.Converter[Src, Dst]` values in `Option.Converters`.

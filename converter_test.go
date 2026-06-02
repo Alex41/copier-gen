@@ -16,6 +16,28 @@ func TestGenericConverter(t *testing.T) {
 	}
 }
 
+func TestFindConverter(t *testing.T) {
+	opt := Option{
+		Converters: []any{
+			Converter[int, string](func(src int) (string, error) {
+				return "ok", nil
+			}),
+		},
+	}
+
+	converter, ok := FindConverter[int, string](opt)
+	if !ok {
+		t.Fatal("FindConverter did not find typed converter")
+	}
+	got, err := converter(1)
+	if err != nil {
+		t.Fatalf("converter returned error: %v", err)
+	}
+	if got != "ok" {
+		t.Fatalf("converter returned %q", got)
+	}
+}
+
 func TestCopyWithRegisteredMapper(t *testing.T) {
 	type src struct{ Name string }
 	type dst struct{ Name string }

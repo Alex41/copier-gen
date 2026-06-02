@@ -9,4 +9,5 @@ var (
 	ErrNotSupported                  = errors.New("not supported")
 	ErrFieldNameTagStartNotUpperCase = errors.New("copier field name tag must be start upper case")
 	ErrGeneratedMapperNotFound       = errors.New("generated mapper not found; run copier-gen for this package")
+	ErrConverterNotFound             = errors.New("typed converter not found")
 )
