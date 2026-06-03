@@ -632,27 +632,6 @@ func importPathForAlias(file *ast.File, alias string) string {
 	return ""
 }
 
-func copyDestinationType(info *types.Info, expr ast.Expr) types.Type {
-	if info == nil {
-		return nil
-	}
-	if t := info.TypeOf(expr); t != nil {
-		return t
-	}
-	unary, ok := expr.(*ast.UnaryExpr)
-	if !ok || unary.Op != token.AND {
-		return nil
-	}
-	inner := info.TypeOf(unary.X)
-	if isInvalidType(inner) {
-		inner = nil
-	}
-	if inner == nil {
-		return nil
-	}
-	return types.NewPointer(inner)
-}
-
 func isInvalidType(t types.Type) bool {
 	if t == nil {
 		return false
@@ -795,7 +774,6 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 					converter:   true,
 					converterFn: converter.fn,
 					insensitive: insensitive,
-					importTypes: []types.Type{srcField.Type(), dstField.Type()},
 				})
 				continue
 			}
@@ -827,7 +805,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 			nilSafe:     assign.nilSafe,
 			zeroAssign:  assign.zeroAssign,
 			insensitive: insensitive,
-			importTypes: []types.Type{srcField.Type(), dstField.Type()},
+			importTypes: assign.importTypes,
 		})
 	}
 
@@ -874,7 +852,7 @@ func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg strin
 			assignExpr:  assign.expr,
 			nilSafe:     assign.nilSafe,
 			zeroAssign:  assign.zeroAssign,
-			importTypes: []types.Type{srcField.Type(), dstField.Type()},
+			importTypes: assign.importTypes,
 		})
 	}
 	return fields, len(fields) > 0
@@ -1022,9 +1000,10 @@ func findField(st *types.Struct, name string) (*types.Var, bool, bool) {
 }
 
 type assignment struct {
-	expr       string
-	nilSafe    bool
-	zeroAssign string
+	expr        string
+	nilSafe     bool
+	zeroAssign  string
+	importTypes []types.Type
 }
 
 func assignmentExpr(src, dst types.Type, srcExpr string, currentPkg string) (assignment, bool) {
@@ -1032,23 +1011,28 @@ func assignmentExpr(src, dst types.Type, srcExpr string, currentPkg string) (ass
 		return assignment{expr: srcExpr}, true
 	}
 	if types.ConvertibleTo(src, dst) {
-		return assignment{expr: fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), srcExpr)}, true
+		return assignment{
+			expr:        fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), srcExpr),
+			importTypes: []types.Type{dst},
+		}, true
 	}
 	if ptr, ok := src.(*types.Pointer); ok {
 		elem := ptr.Elem()
 		deref := "*" + srcExpr
 		if types.AssignableTo(elem, dst) {
 			return assignment{
-				expr:       deref,
-				nilSafe:    true,
-				zeroAssign: fmt.Sprintf("copier.Zero[%s]()", typeString(dst, currentPkg)),
+				expr:        deref,
+				nilSafe:     true,
+				zeroAssign:  fmt.Sprintf("copier.Zero[%s]()", typeString(dst, currentPkg)),
+				importTypes: []types.Type{dst},
 			}, true
 		}
 		if types.ConvertibleTo(elem, dst) {
 			return assignment{
-				expr:       fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), deref),
-				nilSafe:    true,
-				zeroAssign: fmt.Sprintf("copier.Zero[%s]()", typeString(dst, currentPkg)),
+				expr:        fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), deref),
+				nilSafe:     true,
+				zeroAssign:  fmt.Sprintf("copier.Zero[%s]()", typeString(dst, currentPkg)),
+				importTypes: []types.Type{dst},
 			}, true
 		}
 	}
@@ -1181,10 +1165,20 @@ func renderImports(b *bytes.Buffer, imports map[string]string) {
 	sort.Strings(paths)
 	fmt.Fprintln(b, "import (")
 	for _, path := range paths {
-		fmt.Fprintf(b, "%s %q\n", imports[path], path)
+		alias := imports[path]
+		if alias == defaultImportName(path) {
+			fmt.Fprintf(b, "%q\n", path)
+			continue
+		}
+		fmt.Fprintf(b, "%s %q\n", alias, path)
 	}
 	fmt.Fprintln(b, ")")
 	fmt.Fprintln(b)
+}
+
+func defaultImportName(path string) string {
+	parts := strings.Split(path, "/")
+	return sanitizeIdentifier(parts[len(parts)-1])
 }
 
 func uniqueImportName(imports map[string]string, base string) string {
@@ -1245,15 +1239,6 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	fmt.Fprintf(b, "})\n")
 	fmt.Fprintf(b, "}\n")
 	fmt.Fprintln(b)
-
-	fmt.Fprintf(b, "func New%sConverter() copier.Converter[%s, %s] {\n", fn, srcType, dstType)
-	fmt.Fprintf(b, "return func(src %s) (%s, error) {\n", srcType, dstType)
-	fmt.Fprintf(b, "var dst %s\n", dstType)
-	fmt.Fprintf(b, "err := %s(&dst, src, copier.Option{})\n", fn)
-	fmt.Fprintln(b, "return dst, err")
-	fmt.Fprintln(b, "}")
-	fmt.Fprintln(b, "}")
-	fmt.Fprintln(b)
 }
 
 func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
@@ -1290,13 +1275,6 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 	}
 }
 
-func lowerFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToLower(s[:1]) + s[1:]
-}
-
 func typeString(t types.Type, currentPkg string) string {
 	return types.TypeString(t, func(pkg *types.Package) string {
 		if pkg == nil {
@@ -1323,7 +1301,7 @@ func converterKey(src, dst types.Type) string {
 }
 
 func mapperName(pair copyPair) string {
-	return "Copy" + typeNameForFunc(pair.srcType) + "To" + typeNameForFunc(pair.dstType)
+	return "copy" + typeNameForFunc(pair.srcType) + "To" + typeNameForFunc(pair.dstType)
 }
 
 func typeNameForFunc(t types.Type) string {

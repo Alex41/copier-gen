@@ -26,11 +26,11 @@ activity.go -> activity_copier_gen.go
 ```
 
 ```go
-func CopyUserToEmployee(to *Employee, from User, opt copier.Option) error
-func NewUserToEmployeeConverter() copier.Converter[User, Employee]
+func copyUserToEmployee(to *Employee, from User, opt copier.Option) error
 ```
 
-Generated files also register a mapper in `init()`. Existing calls such as
+Generated mapper functions are private and register themselves in `init()`.
+Existing calls such as
 `copier.CopyWithOption(&dst, src, opt)` dispatch to that generated mapper using
 ordinary Go type assertions. No reflection is used.
 
