@@ -1002,14 +1002,30 @@ func pointerDeepAssignment(src, dst types.Type, srcExpr string, currentPkg strin
 	if !ok {
 		return assignment{}, false
 	}
-	if _, ok := structType(srcPtr.Elem()); ok {
-		return assignment{}, false
+	if !isTimeType(srcPtr.Elem()) {
+		if _, ok := structType(srcPtr.Elem()); ok {
+			return assignment{}, false
+		}
 	}
-	if _, ok := structType(dstPtr.Elem()); ok {
+	if !isTimeType(dstPtr.Elem()) {
+		if _, ok := structType(dstPtr.Elem()); ok {
+			return assignment{}, false
+		}
+	}
+	if isTimeType(srcPtr.Elem()) != isTimeType(dstPtr.Elem()) {
 		return assignment{}, false
 	}
 	assign, ok := assignmentExpr(srcPtr.Elem(), dstPtr.Elem(), "*"+srcExpr, currentPkg)
 	return assign, ok
+}
+
+func isTimeType(t types.Type) bool {
+	named, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := named.Obj()
+	return obj.Name() == "Time" && obj.Pkg() != nil && obj.Pkg().Path() == "time"
 }
 
 func sliceDeepAssignment(src, dst types.Type, currentPkg string) (assignment, bool) {

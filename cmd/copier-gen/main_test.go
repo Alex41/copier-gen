@@ -587,6 +587,57 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderDeepCopyTimePointerField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import (
+	"time"
+
+	copier "github.com/Alex41/copier-gen"
+)
+
+type Source struct {
+	Birthdate *time.Time
+}
+
+type Destination struct {
+	Birthdate *time.Time
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		`"time"`,
+		"if from.Birthdate != nil",
+		"copied := *from.Birthdate",
+		"to.Birthdate = &copied",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "to.Birthdate = from.Birthdate") {
+		t.Fatalf("generated output used shallow time pointer assignment:\n%s", text)
+	}
+}
+
 func TestRenderDeepCopyPointerToValueField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
