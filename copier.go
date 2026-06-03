@@ -20,14 +20,18 @@ type Option struct {
 	IgnoreEmpty   bool
 	CaseSensitive bool
 	DeepCopy      bool
+	Converters    Converters
 }
 
 // Converter is a typed conversion hook. It intentionally has no SrcType/DstType
 // fields: the Go type parameters are the contract.
 type Converter[S, D any] func(src S) (dst D, err error)
 
-// UseConverter marks a typed converter for copier-gen. Keep calls to this
-// function in package-level declarations so the generator can discover them.
+// Converters is a generation-time list of typed converter markers.
+type Converters []any
+
+// UseConverter marks a typed converter for copier-gen. Put calls into
+// Option.Converters so the generator can emit direct converter calls.
 func UseConverter[S, D any](converter Converter[S, D]) Converter[S, D] {
 	return converter
 }

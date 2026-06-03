@@ -352,11 +352,13 @@ func ConvertRaw(src Raw) (Formatted, error) {
 	return Formatted{Label: src.Value}, nil
 }
 
-var _ = copier.UseConverter[Raw, Formatted](ConvertRaw)
-
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{})
+	return copier.CopyWithOption(dst, src, copier.Option{
+		Converters: copier.Converters{
+			copier.UseConverter[Raw, Formatted](ConvertRaw),
+		},
+	})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
@@ -419,6 +421,94 @@ func Cast(src Source) error {
 	}
 	if !strings.Contains(err.Error(), "needs converter") {
 		t.Fatalf("error does not explain missing converter: %v", err)
+	}
+}
+
+func TestLoadModelIgnoresDashTaggedDestinationField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Ignored Raw
+}
+
+type Destination struct {
+	Ignored Formatted ` + "`copier:\"-\"`" + `
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.CopyWithOption(dst, src, copier.Option{})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error for ignored field: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	if strings.Contains(string(out), "to.Ignored") {
+		t.Fatalf("generated output copies ignored field:\n%s", string(out))
+	}
+}
+
+func TestLoadModelIgnoresDashTaggedSourceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Ignored Raw ` + "`copier:\"-\"`" + `
+}
+
+type Destination struct {
+	Ignored Formatted
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.CopyWithOption(dst, src, copier.Option{})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error for ignored source field: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	if strings.Contains(string(out), "from.Ignored") || strings.Contains(string(out), "to.Ignored") {
+		t.Fatalf("generated output copies ignored source field:\n%s", string(out))
 	}
 }
 

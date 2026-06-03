@@ -53,12 +53,18 @@ func FormatStatus(src RawStatus) (FormattedStatus, error) {
 	return FormattedStatus{Value: src.Value}, nil
 }
 
-var _ = copier.UseConverter[RawStatus, FormattedStatus](FormatStatus)
+err := copier.CopyWithOption(&dst, src, copier.Option{
+	Converters: copier.Converters{
+		copier.UseConverter[RawStatus, FormattedStatus](FormatStatus),
+	},
+})
 ```
 
-Generated code calls `FormatStatus(from.Status)` directly for fields that
-cannot be assigned or converted directly. If the generator cannot find a
-matching `UseConverter[Src, Dst]` declaration, `go generate` fails.
+The generator reads `Option.Converters` during `go generate`. Generated code
+calls `FormatStatus(from.Status)` directly for fields that cannot be assigned
+or converted directly. If the generator cannot find a matching
+`UseConverter[Src, Dst]` marker for a required field conversion, `go generate`
+fails.
 
 ## Tags And Options
 
@@ -77,6 +83,7 @@ Supported options:
 | --- | --- |
 | `IgnoreEmpty` | Skip zero source values unless the destination field has `override`. |
 | `CaseSensitive` | Disable generated case-insensitive fallback matches. |
+| `Converters` | Generation-time typed converter markers used to emit direct converter calls. |
 
 `DeepCopy` is reserved in `Option`; nested copy generation is the next step.
 
@@ -97,4 +104,4 @@ copied. That is where custom converters, nested structs, slices, maps, methods,
 SQL Scanner/Valuer support, and field-name mapping config should be added.
 
 Legacy inline `copier.TypeConverter{SrcType, DstType, Fn}` blocks are not kept.
-Use package-level `copier.UseConverter[Src, Dst](Fn)` declarations instead.
+Use `copier.UseConverter[Src, Dst](Fn)` inside `Option.Converters` instead.

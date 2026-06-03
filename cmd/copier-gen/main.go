@@ -63,6 +63,7 @@ type copyPair struct {
 	dst          *types.Struct
 	fromPtr      bool
 	fields       []fieldCopy
+	converters   map[string]staticConverter
 	sourceFile   string
 	discoveredAt string
 }
@@ -173,7 +174,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 			continue
 		}
 		seen[key] = true
-		built, err := buildPairFromTypes(pair, pkg.PkgPath, m.converters)
+		built, err := buildPairFromTypes(pair, pkg.PkgPath, mergeConverters(m.converters, pair.converters))
 		if err != nil {
 			return model{}, generationError{err: err}
 		}
@@ -242,7 +243,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 			continue
 		}
 		seen[key] = true
-		built, err := buildPairFromTypes(pair, pkg.Path(), m.converters)
+		built, err := buildPairFromTypes(pair, pkg.Path(), mergeConverters(m.converters, pair.converters))
 		if err != nil {
 			return model{}, err
 		}
@@ -292,6 +293,10 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 				issues = append(issues, fmt.Sprintf("%s: source argument is not a named struct or pointer to named struct: %s", location, typeKeyOrUnknown(srcType)))
 				return true
 			}
+			pairConverters := map[string]staticConverter{}
+			if len(call.Args) >= 3 {
+				pairConverters = discoverOptionConverters(fset, file, info, call.Args[2])
+			}
 			pairs = append(pairs, copyPair{
 				srcName:      srcNamed.Obj().Name(),
 				dstName:      dstNamed.Obj().Name(),
@@ -300,6 +305,7 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 				src:          srcNamed.Underlying().(*types.Struct),
 				dst:          dstNamed.Underlying().(*types.Struct),
 				fromPtr:      fromPtr,
+				converters:   pairConverters,
 				sourceFile:   sourceFile,
 				discoveredAt: fmt.Sprintf("%s:%d", filepath.Base(pos.Filename), pos.Line),
 			})
@@ -313,28 +319,100 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 func discoverStaticConverters(fset *token.FileSet, files []*ast.File, info *types.Info) map[string]staticConverter {
 	converters := map[string]staticConverter{}
 	for _, file := range files {
-		ast.Inspect(file, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok || len(call.Args) != 1 {
-				return true
+		for _, decl := range file.Decls {
+			genDecl, ok := decl.(*ast.GenDecl)
+			if !ok || genDecl.Tok != token.VAR {
+				continue
 			}
-			src, dst, ok := useConverterTypes(file, call, info)
-			if !ok {
-				return true
+			for _, spec := range genDecl.Specs {
+				valueSpec, ok := spec.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				for _, value := range valueSpec.Values {
+					call, ok := value.(*ast.CallExpr)
+					if !ok {
+						continue
+					}
+					converter, ok := staticConverterFromUseCall(fset, file, info, call)
+					if !ok {
+						continue
+					}
+					converters[converterKey(converter.srcType, converter.dstType)] = converter
+				}
 			}
-			fn, ok := converterFunctionName(fset, call.Args[0])
-			if !ok {
-				return true
-			}
-			converters[converterKey(src, dst)] = staticConverter{
-				srcType: src,
-				dstType: dst,
-				fn:      fn,
-			}
-			return true
-		})
+		}
 	}
 	return converters
+}
+
+func discoverOptionConverters(fset *token.FileSet, file *ast.File, info *types.Info, expr ast.Expr) map[string]staticConverter {
+	converters := map[string]staticConverter{}
+	for _, converter := range convertersFromExpr(fset, file, info, expr) {
+		converters[converterKey(converter.srcType, converter.dstType)] = converter
+	}
+	return converters
+}
+
+func convertersFromExpr(fset *token.FileSet, file *ast.File, info *types.Info, expr ast.Expr) []staticConverter {
+	var converters []staticConverter
+	switch e := expr.(type) {
+	case *ast.CompositeLit:
+		for _, elt := range e.Elts {
+			switch kv := elt.(type) {
+			case *ast.KeyValueExpr:
+				key, ok := kv.Key.(*ast.Ident)
+				if !ok || key.Name != "Converters" {
+					continue
+				}
+				converters = append(converters, convertersFromExpr(fset, file, info, kv.Value)...)
+			default:
+				converters = append(converters, convertersFromExpr(fset, file, info, elt)...)
+			}
+		}
+	case *ast.CallExpr:
+		converter, ok := staticConverterFromUseCall(fset, file, info, e)
+		if ok {
+			converters = append(converters, converter)
+		}
+	}
+	return converters
+}
+
+func staticConverterFromUseCall(fset *token.FileSet, file *ast.File, info *types.Info, call *ast.CallExpr) (staticConverter, bool) {
+	if len(call.Args) != 1 {
+		return staticConverter{}, false
+	}
+	src, dst, ok := useConverterTypes(file, call, info)
+	if !ok {
+		return staticConverter{}, false
+	}
+	fn, ok := converterFunctionName(fset, call.Args[0])
+	if !ok {
+		return staticConverter{}, false
+	}
+	return staticConverter{
+		srcType: src,
+		dstType: dst,
+		fn:      fn,
+	}, true
+}
+
+func mergeConverters(base, override map[string]staticConverter) map[string]staticConverter {
+	if len(base) == 0 {
+		return override
+	}
+	if len(override) == 0 {
+		return base
+	}
+	merged := make(map[string]staticConverter, len(base)+len(override))
+	for key, converter := range base {
+		merged[key] = converter
+	}
+	for key, converter := range override {
+		merged[key] = converter
+	}
+	return merged
 }
 
 func useConverterTypes(file *ast.File, call *ast.CallExpr, info *types.Info) (types.Type, types.Type, bool) {
@@ -688,7 +766,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 		}
 
 		srcFieldName := sourceNameFor(dstField.Name(), dstTag.name, srcTags)
-		srcField, insensitive, ok := findField(pair.src, srcFieldName)
+		srcField, insensitive, ok := findSourceField(pair.src, srcFieldName, srcTags)
 		if !ok {
 			if flags&tagMust == 0 {
 				continue
@@ -879,6 +957,9 @@ func parseTag(tag string) (tagInfo, error) {
 func sourceNameFor(dstFieldName, dstTagName string, srcTags map[string]tagInfo) string {
 	if dstTagName != "" {
 		for srcField, tag := range srcTags {
+			if tag.flags&tagIgnore != 0 {
+				continue
+			}
 			if tag.name == dstTagName {
 				return srcField
 			}
@@ -886,11 +967,36 @@ func sourceNameFor(dstFieldName, dstTagName string, srcTags map[string]tagInfo) 
 		return dstTagName
 	}
 	for srcField, tag := range srcTags {
+		if tag.flags&tagIgnore != 0 {
+			continue
+		}
 		if tag.name == dstFieldName {
 			return srcField
 		}
 	}
 	return dstFieldName
+}
+
+func findSourceField(st *types.Struct, name string, tags map[string]tagInfo) (*types.Var, bool, bool) {
+	for i := 0; i < st.NumFields(); i++ {
+		field := st.Field(i)
+		if !field.Exported() || tags[field.Name()].flags&tagIgnore != 0 {
+			continue
+		}
+		if field.Name() == name {
+			return field, false, true
+		}
+	}
+	for i := 0; i < st.NumFields(); i++ {
+		field := st.Field(i)
+		if !field.Exported() || tags[field.Name()].flags&tagIgnore != 0 {
+			continue
+		}
+		if strings.EqualFold(field.Name(), name) {
+			return field, true, true
+		}
+	}
+	return nil, false, false
 }
 
 func findField(st *types.Struct, name string) (*types.Var, bool, bool) {
