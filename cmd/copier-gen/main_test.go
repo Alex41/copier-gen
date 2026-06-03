@@ -541,6 +541,171 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderDeepCopyPointerField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Title *string
+}
+
+type Destination struct {
+	Title *string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Title != nil",
+		"copied := *from.Title",
+		"to.Title = &copied",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "to.Title = from.Title") {
+		t.Fatalf("generated output used shallow pointer assignment:\n%s", text)
+	}
+}
+
+func TestRenderDeepCopyPointerToValueField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Enabled *bool
+}
+
+type Destination struct {
+	Enabled bool
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Enabled != nil",
+		"to.Enabled = *from.Enabled",
+		"to.Enabled = copiergen.Zero[bool]()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderDeepCopySliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Counts []uint
+}
+
+type Destination struct {
+	Counts []uint8
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"copied := make([]uint8, 0, len(from.Counts))",
+		"for _, item := range from.Counts",
+		"copied = append(copied, uint8(item))",
+		"to.Counts = copied",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestLoadModelFailsWhenDeepCopyCannotBeGenerated(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Values map[string]string
+}
+
+type Destination struct {
+	Values map[string]string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadModel(dir, nil)
+	if err == nil {
+		t.Fatal("loadModel succeeded for unsupported deep copy")
+	}
+	if !strings.Contains(err.Error(), "cannot generate deep copy mapper") {
+		t.Fatalf("error does not explain unsupported deep copy: %v", err)
+	}
+}
+
 func TestRenderUsesInferredElementConverterForSliceField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample

@@ -62,6 +62,7 @@ type copyPair struct {
 	src          *types.Struct
 	dst          *types.Struct
 	fromPtr      bool
+	deepCopy     bool
 	fields       []fieldCopy
 	converters   map[string]staticConverter
 	sourceFile   string
@@ -82,6 +83,8 @@ type fieldCopy struct {
 	nested           []fieldCopy
 	nestedPtr        bool
 	nestedAlloc      string
+	ptrCopy          bool
+	sliceCopy        bool
 	converter        bool
 	slice            bool
 	converterFn      string
@@ -298,9 +301,9 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 				issues = append(issues, fmt.Sprintf("%s: source argument is not a named struct or pointer to named struct: %s", location, typeKeyOrUnknown(srcType)))
 				return true
 			}
-			pairConverters := map[string]staticConverter{}
+			var option copierOption
 			if len(call.Args) >= 3 {
-				pairConverters = discoverOptionConverters(fset, file, info, call.Args[2])
+				option = discoverOption(fset, file, info, call.Args[2])
 			}
 			pairs = append(pairs, copyPair{
 				srcName:      srcNamed.Obj().Name(),
@@ -310,7 +313,8 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 				src:          srcNamed.Underlying().(*types.Struct),
 				dst:          dstNamed.Underlying().(*types.Struct),
 				fromPtr:      fromPtr,
-				converters:   pairConverters,
+				deepCopy:     option.deepCopy,
+				converters:   option.converters,
 				sourceFile:   sourceFile,
 				discoveredAt: fmt.Sprintf("%s:%d", filepath.Base(pos.Filename), pos.Line),
 			})
@@ -349,6 +353,38 @@ func discoverStaticConverters(fset *token.FileSet, files []*ast.File, info *type
 		}
 	}
 	return converters
+}
+
+type copierOption struct {
+	deepCopy   bool
+	converters map[string]staticConverter
+}
+
+func discoverOption(fset *token.FileSet, file *ast.File, info *types.Info, expr ast.Expr) copierOption {
+	return copierOption{
+		deepCopy:   discoverOptionDeepCopy(expr),
+		converters: discoverOptionConverters(fset, file, info, expr),
+	}
+}
+
+func discoverOptionDeepCopy(expr ast.Expr) bool {
+	lit, ok := expr.(*ast.CompositeLit)
+	if !ok {
+		return false
+	}
+	for _, elt := range lit.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		key, ok := kv.Key.(*ast.Ident)
+		if !ok || key.Name != "DeepCopy" {
+			continue
+		}
+		value, ok := kv.Value.(*ast.Ident)
+		return ok && value.Name == "true"
+	}
+	return false
 }
 
 func discoverOptionConverters(fset *token.FileSet, file *ast.File, info *types.Info, expr ast.Expr) map[string]staticConverter {
@@ -785,27 +821,42 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 			continue
 		}
 
+		if pair.deepCopy && needsDeepCopy(srcField.Type()) {
+			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg); ok {
+				pair.fields = append(pair.fields, field)
+				continue
+			}
+			if converter, ok := sliceElementConverter(srcField.Type(), dstField.Type(), converters); ok {
+				pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter))
+				continue
+			}
+			if assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), "from."+srcField.Name(), currentPkg); ok && assign.nilSafe {
+				pair.fields = append(pair.fields, fieldCopy{
+					srcName:     srcField.Name(),
+					srcExpr:     "from." + srcField.Name(),
+					dstName:     dstField.Name(),
+					srcType:     srcField.Type(),
+					dstType:     dstField.Type(),
+					flags:       flags,
+					zeroExpr:    zeroExpr(srcField.Type(), "from."+srcField.Name()),
+					assignExpr:  assign.expr,
+					nilSafe:     assign.nilSafe,
+					zeroAssign:  assign.zeroAssign,
+					insensitive: insensitive,
+					importTypes: assign.importTypes,
+				})
+				continue
+			}
+			return copyPair{}, fmt.Errorf("cannot generate deep copy mapper %s -> %s: field %s needs supported deep copy or converter %s -> %s",
+				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), typeKey(srcField.Type()), typeKey(dstField.Type()))
+		}
+
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), "from."+srcField.Name(), currentPkg)
 		if !ok {
 			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopies(srcField.Type(), dstField.Type(), "from."+srcField.Name(), dstField.Name(), currentPkg)
 			if !nestedOK {
 				if converter, ok := sliceElementConverter(srcField.Type(), dstField.Type(), converters); ok {
-					pair.fields = append(pair.fields, fieldCopy{
-						srcName:          srcField.Name(),
-						srcExpr:          "from." + srcField.Name(),
-						dstName:          dstField.Name(),
-						srcType:          srcField.Type(),
-						dstType:          dstField.Type(),
-						flags:            flags,
-						zeroExpr:         zeroExpr(srcField.Type(), "from."+srcField.Name()),
-						converter:        true,
-						slice:            true,
-						converterFn:      converter.fn,
-						converterSrcType: converter.srcType,
-						converterDstType: converter.dstType,
-						insensitive:      insensitive,
-						importTypes:      []types.Type{converter.srcType, converter.dstType, dstField.Type()},
-					})
+					pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter))
 					continue
 				}
 				{
@@ -868,7 +919,120 @@ func converterFieldCopy(srcField, dstField *types.Var, flags uint8, insensitive 
 	}
 }
 
+func sliceConverterFieldCopy(srcField, dstField *types.Var, flags uint8, insensitive bool, converter staticConverter) fieldCopy {
+	return fieldCopy{
+		srcName:          srcField.Name(),
+		srcExpr:          "from." + srcField.Name(),
+		dstName:          dstField.Name(),
+		srcType:          srcField.Type(),
+		dstType:          dstField.Type(),
+		flags:            flags,
+		zeroExpr:         zeroExpr(srcField.Type(), "from."+srcField.Name()),
+		converter:        true,
+		slice:            true,
+		converterFn:      converter.fn,
+		converterSrcType: converter.srcType,
+		converterDstType: converter.dstType,
+		insensitive:      insensitive,
+		importTypes:      []types.Type{converter.srcType, converter.dstType, dstField.Type()},
+	}
+}
+
+func deepFieldCopy(srcField, dstField *types.Var, flags uint8, insensitive bool, currentPkg string) (fieldCopy, bool) {
+	srcExpr := "from." + srcField.Name()
+	if nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(srcField.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg); ok {
+		return fieldCopy{
+			srcName:     srcField.Name(),
+			srcExpr:     srcExpr,
+			dstName:     dstField.Name(),
+			srcType:     srcField.Type(),
+			dstType:     dstField.Type(),
+			flags:       flags,
+			zeroExpr:    zeroExpr(srcField.Type(), srcExpr),
+			nilSafe:     true,
+			zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
+			nested:      nested,
+			nestedPtr:   nestedPtr,
+			nestedAlloc: nestedAlloc,
+			insensitive: insensitive,
+			importTypes: []types.Type{dstField.Type()},
+		}, true
+	}
+	if assign, ok := pointerDeepAssignment(srcField.Type(), dstField.Type(), srcExpr, currentPkg); ok {
+		return fieldCopy{
+			srcName:     srcField.Name(),
+			srcExpr:     srcExpr,
+			dstName:     dstField.Name(),
+			srcType:     srcField.Type(),
+			dstType:     dstField.Type(),
+			flags:       flags,
+			zeroExpr:    zeroExpr(srcField.Type(), srcExpr),
+			ptrCopy:     true,
+			assignExpr:  assign.expr,
+			zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
+			insensitive: insensitive,
+			importTypes: append(assign.importTypes, dstField.Type()),
+		}, true
+	}
+	if assign, ok := sliceDeepAssignment(srcField.Type(), dstField.Type(), currentPkg); ok {
+		return fieldCopy{
+			srcName:     srcField.Name(),
+			srcExpr:     srcExpr,
+			dstName:     dstField.Name(),
+			srcType:     srcField.Type(),
+			dstType:     dstField.Type(),
+			flags:       flags,
+			zeroExpr:    zeroExpr(srcField.Type(), srcExpr),
+			sliceCopy:   true,
+			assignExpr:  assign.expr,
+			zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
+			insensitive: insensitive,
+			importTypes: append(assign.importTypes, dstField.Type()),
+		}, true
+	}
+	return fieldCopy{}, false
+}
+
+func pointerDeepAssignment(src, dst types.Type, srcExpr string, currentPkg string) (assignment, bool) {
+	srcPtr, ok := src.(*types.Pointer)
+	if !ok {
+		return assignment{}, false
+	}
+	dstPtr, ok := dst.(*types.Pointer)
+	if !ok {
+		return assignment{}, false
+	}
+	if _, ok := structType(srcPtr.Elem()); ok {
+		return assignment{}, false
+	}
+	if _, ok := structType(dstPtr.Elem()); ok {
+		return assignment{}, false
+	}
+	assign, ok := assignmentExpr(srcPtr.Elem(), dstPtr.Elem(), "*"+srcExpr, currentPkg)
+	return assign, ok
+}
+
+func sliceDeepAssignment(src, dst types.Type, currentPkg string) (assignment, bool) {
+	srcSlice, ok := src.Underlying().(*types.Slice)
+	if !ok {
+		return assignment{}, false
+	}
+	dstSlice, ok := dst.Underlying().(*types.Slice)
+	if !ok {
+		return assignment{}, false
+	}
+	assign, ok := assignmentExpr(srcSlice.Elem(), dstSlice.Elem(), "item", currentPkg)
+	return assign, ok
+}
+
 func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg string) ([]fieldCopy, bool, string, bool) {
+	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, 0)
+}
+
+func nestedFieldCopiesDepth(src, dst types.Type, srcExpr, dstPrefix, currentPkg string, depth int) ([]fieldCopy, bool, string, bool) {
+	if depth > 8 {
+		return nil, false, "", false
+	}
 	ptr, ok := src.(*types.Pointer)
 	if !ok {
 		return nil, false, "", false
@@ -901,7 +1065,26 @@ func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg strin
 		source := srcExpr + "." + srcField.Name()
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), source, currentPkg)
 		if !ok {
-			return nil, false, "", false
+			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(srcField.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, depth+1)
+			if !nestedOK {
+				return nil, false, "", false
+			}
+			fields = append(fields, fieldCopy{
+				srcName:     srcField.Name(),
+				srcExpr:     source,
+				dstName:     dstPrefix + "." + dstField.Name(),
+				srcType:     srcField.Type(),
+				dstType:     dstField.Type(),
+				flags:       0,
+				zeroExpr:    zeroExpr(srcField.Type(), source),
+				nilSafe:     true,
+				zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
+				nested:      nested,
+				nestedPtr:   nestedPtr,
+				nestedAlloc: nestedAlloc,
+				importTypes: []types.Type{dstField.Type()},
+			})
+			continue
 		}
 		fields = append(fields, fieldCopy{
 			srcName:     srcField.Name(),
@@ -1138,6 +1321,14 @@ func isNilable(t types.Type) bool {
 	return false
 }
 
+func needsDeepCopy(t types.Type) bool {
+	switch t.Underlying().(type) {
+	case *types.Pointer, *types.Slice, *types.Map:
+		return true
+	}
+	return false
+}
+
 func render(m model) ([]byte, error) {
 	var b bytes.Buffer
 	imports := collectImports(m)
@@ -1356,6 +1547,23 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		for _, nested := range field.nested {
 			renderFieldCopy(b, nested, currentPkg)
 		}
+		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		fmt.Fprintln(b, "}")
+	} else if field.ptrCopy {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		fmt.Fprintf(b, "copied := %s\n", field.assignExpr)
+		fmt.Fprintf(b, "to.%s = &copied\n", field.dstName)
+		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		fmt.Fprintln(b, "}")
+	} else if field.sliceCopy {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		fmt.Fprintf(b, "copied := make(%s, 0, len(%s))\n", typeString(field.dstType, currentPkg), field.srcExpr)
+		fmt.Fprintf(b, "for _, item := range %s {\n", field.srcExpr)
+		fmt.Fprintf(b, "copied = append(copied, %s)\n", field.assignExpr)
+		fmt.Fprintln(b, "}")
+		fmt.Fprintf(b, "to.%s = copied\n", field.dstName)
 		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
 		fmt.Fprintln(b, "}")

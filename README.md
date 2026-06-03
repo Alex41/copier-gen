@@ -84,9 +84,8 @@ Supported options:
 | --- | --- |
 | `IgnoreEmpty` | Skip zero source values unless the destination field has `override`. |
 | `CaseSensitive` | Disable generated case-insensitive fallback matches. |
+| `DeepCopy` | Generate deep copies for supported pointer/slice/nested fields; generation fails when a field would need unsupported deep copy. |
 | `Converters` | Generation-time typed converter markers used to emit direct converter calls. |
-
-`DeepCopy` is reserved in `Option`; nested copy generation is the next step.
 
 ## Generator Scope
 
