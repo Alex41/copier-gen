@@ -355,6 +355,56 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderNestedPointerStructToPointerStructWithConvertibleFields(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Range[T comparable] struct {
+	From T
+	To T
+}
+
+type Source struct {
+	FileLimit *Range[uint]
+}
+
+type Destination struct {
+	FileLimit *Range[uint8]
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.FileLimit != nil",
+		"to.FileLimit = new(Range[uint8])",
+		"to.FileLimit.From = uint8(from.FileLimit.From)",
+		"to.FileLimit.To = uint8(from.FileLimit.To)",
+		"to.FileLimit = copiergen.Zero[*Range[uint8]]()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestWriteGeneratedFilesUsesSourceFileNames(t *testing.T) {
 	dir := t.TempDir()
 	m := model{
@@ -433,6 +483,61 @@ func Cast(src Source) error {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRenderPrefersExactConverterOverDirectAssignment(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Title *string
+}
+
+type Destination struct {
+	Title *string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Converters: copier.Converters{
+			copier.UseConverter(func(src *string) (*string, error) {
+				if src == nil || *src == "" {
+					return nil, nil
+				}
+				return src, nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverter[*string, *string](opt.Converters)",
+		"converted, err := converter(from.Title)",
+		"to.Title = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "to.Title = from.Title") {
+		t.Fatalf("generated output used direct assignment instead of converter:\n%s", text)
 	}
 }
 

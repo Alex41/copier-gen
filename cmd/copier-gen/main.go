@@ -80,6 +80,8 @@ type fieldCopy struct {
 	nilSafe          bool
 	zeroAssign       string
 	nested           []fieldCopy
+	nestedPtr        bool
+	nestedAlloc      string
 	converter        bool
 	slice            bool
 	converterFn      string
@@ -778,28 +780,15 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), srcFieldName)
 		}
 
+		if converter, ok := converters[converterKey(srcField.Type(), dstField.Type())]; ok {
+			pair.fields = append(pair.fields, converterFieldCopy(srcField, dstField, flags, insensitive, converter))
+			continue
+		}
+
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), "from."+srcField.Name(), currentPkg)
 		if !ok {
-			nested, nestedOK := nestedFieldCopies(srcField.Type(), dstField.Type(), "from."+srcField.Name(), dstField.Name(), currentPkg)
+			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopies(srcField.Type(), dstField.Type(), "from."+srcField.Name(), dstField.Name(), currentPkg)
 			if !nestedOK {
-				if converter, ok := converters[converterKey(srcField.Type(), dstField.Type())]; ok {
-					pair.fields = append(pair.fields, fieldCopy{
-						srcName:          srcField.Name(),
-						srcExpr:          "from." + srcField.Name(),
-						dstName:          dstField.Name(),
-						srcType:          srcField.Type(),
-						dstType:          dstField.Type(),
-						flags:            flags,
-						zeroExpr:         zeroExpr(srcField.Type(), "from."+srcField.Name()),
-						converter:        true,
-						converterFn:      converter.fn,
-						converterSrcType: converter.srcType,
-						converterDstType: converter.dstType,
-						insensitive:      insensitive,
-						importTypes:      []types.Type{converter.srcType, converter.dstType},
-					})
-					continue
-				}
 				if converter, ok := sliceElementConverter(srcField.Type(), dstField.Type(), converters); ok {
 					pair.fields = append(pair.fields, fieldCopy{
 						srcName:          srcField.Name(),
@@ -835,6 +824,8 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				nilSafe:     true,
 				zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
 				nested:      nested,
+				nestedPtr:   nestedPtr,
+				nestedAlloc: nestedAlloc,
 				importTypes: []types.Type{dstField.Type()},
 			})
 			continue
@@ -859,18 +850,42 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 	return pair, nil
 }
 
-func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg string) ([]fieldCopy, bool) {
+func converterFieldCopy(srcField, dstField *types.Var, flags uint8, insensitive bool, converter staticConverter) fieldCopy {
+	return fieldCopy{
+		srcName:          srcField.Name(),
+		srcExpr:          "from." + srcField.Name(),
+		dstName:          dstField.Name(),
+		srcType:          srcField.Type(),
+		dstType:          dstField.Type(),
+		flags:            flags,
+		zeroExpr:         zeroExpr(srcField.Type(), "from."+srcField.Name()),
+		converter:        true,
+		converterFn:      converter.fn,
+		converterSrcType: converter.srcType,
+		converterDstType: converter.dstType,
+		insensitive:      insensitive,
+		importTypes:      []types.Type{converter.srcType, converter.dstType},
+	}
+}
+
+func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg string) ([]fieldCopy, bool, string, bool) {
 	ptr, ok := src.(*types.Pointer)
 	if !ok {
-		return nil, false
+		return nil, false, "", false
 	}
 	srcStruct, ok := structType(ptr.Elem())
 	if !ok {
-		return nil, false
+		return nil, false, "", false
 	}
-	dstStruct, ok := structType(dst)
+	dstPtr := false
+	dstStructType := dst
+	if ptr, ok := dst.(*types.Pointer); ok {
+		dstPtr = true
+		dstStructType = ptr.Elem()
+	}
+	dstStruct, ok := structType(dstStructType)
 	if !ok {
-		return nil, false
+		return nil, false, "", false
 	}
 
 	var fields []fieldCopy
@@ -886,7 +901,7 @@ func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg strin
 		source := srcExpr + "." + srcField.Name()
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), source, currentPkg)
 		if !ok {
-			return nil, false
+			return nil, false, "", false
 		}
 		fields = append(fields, fieldCopy{
 			srcName:     srcField.Name(),
@@ -902,7 +917,11 @@ func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg strin
 			importTypes: assign.importTypes,
 		})
 	}
-	return fields, len(fields) > 0
+	alloc := ""
+	if dstPtr {
+		alloc = typeString(dstStructType, currentPkg)
+	}
+	return fields, dstPtr, alloc, len(fields) > 0
 }
 
 func sliceElementConverter(src, dst types.Type, converters map[string]staticConverter) (staticConverter, bool) {
@@ -1331,6 +1350,9 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintln(b, "}")
 	} else if len(field.nested) > 0 {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		if field.nestedPtr {
+			fmt.Fprintf(b, "to.%s = new(%s)\n", field.dstName, field.nestedAlloc)
+		}
 		for _, nested := range field.nested {
 			renderFieldCopy(b, nested, currentPkg)
 		}
