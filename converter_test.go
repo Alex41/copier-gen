@@ -34,7 +34,7 @@ func TestCopyWithRegisteredMapper(t *testing.T) {
 	type src struct{ Name string }
 	type dst struct{ Name string }
 
-	RegisterMapper(func(toValue interface{}, fromValue interface{}, opt Option) (bool, error) {
+	RegisterMapper(func(toValue, fromValue any, opt Option) (bool, error) {
 		to, ok := toValue.(*dst)
 		if !ok {
 			return false, nil
@@ -43,15 +43,26 @@ func TestCopyWithRegisteredMapper(t *testing.T) {
 		if !ok {
 			return false, nil
 		}
+		if opt.IgnoreEmpty {
+			return true, nil
+		}
 		to.Name = from.Name
 		return true, nil
 	})
 
 	var out dst
-	if err := CopyWithOption(&out, src{Name: "generated"}, Option{}); err != nil {
-		t.Fatalf("CopyWithOption returned error: %v", err)
+	if err := Copy(&out, src{Name: "generated"}); err != nil {
+		t.Fatalf("Copy returned error: %v", err)
 	}
 	if out.Name != "generated" {
 		t.Fatalf("registered mapper copied %q", out.Name)
+	}
+
+	out = dst{}
+	if err := Copy(&out, src{Name: "ignored"}, Option{IgnoreEmpty: true}); err != nil {
+		t.Fatalf("Copy with option returned error: %v", err)
+	}
+	if out.Name != "" {
+		t.Fatalf("registered mapper ignored option and copied %q", out.Name)
 	}
 }

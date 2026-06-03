@@ -113,7 +113,7 @@ func main() {
 		if len(m.issues) > 0 {
 			fatalf("found copier calls, but could not generate mappers:\n%s", strings.Join(m.issues, "\n"))
 		}
-		fatalf("no copier.Copy or copier.CopyWithOption calls found; pass -pair Src:Dst for an explicit mapper")
+		fatalf("no copier.Copy calls found; pass -pair Src:Dst for an explicit mapper")
 	}
 
 	if err := writeGeneratedFiles(*dir, *out, m); err != nil {
@@ -644,7 +644,7 @@ func isCopierCall(file *ast.File, call *ast.CallExpr, info *types.Info) bool {
 	if !ok {
 		return false
 	}
-	if sel.Sel.Name != "Copy" && sel.Sel.Name != "CopyWithOption" {
+	if sel.Sel.Name != "Copy" {
 		return false
 	}
 	return isCopierSelectorCall(file, call, info)
@@ -786,7 +786,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				flags:       flags,
 				zeroExpr:    zeroExpr(srcField.Type(), "from."+srcField.Name()),
 				nilSafe:     true,
-				zeroAssign:  fmt.Sprintf("copier.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
+				zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg)),
 				nested:      nested,
 				importTypes: []types.Type{dstField.Type()},
 			})
@@ -1023,7 +1023,7 @@ func assignmentExpr(src, dst types.Type, srcExpr string, currentPkg string) (ass
 			return assignment{
 				expr:        deref,
 				nilSafe:     true,
-				zeroAssign:  fmt.Sprintf("copier.Zero[%s]()", typeString(dst, currentPkg)),
+				zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dst, currentPkg)),
 				importTypes: []types.Type{dst},
 			}, true
 		}
@@ -1031,7 +1031,7 @@ func assignmentExpr(src, dst types.Type, srcExpr string, currentPkg string) (ass
 			return assignment{
 				expr:        fmt.Sprintf("%s(%s)", typeString(dst, currentPkg), deref),
 				nilSafe:     true,
-				zeroAssign:  fmt.Sprintf("copier.Zero[%s]()", typeString(dst, currentPkg)),
+				zeroAssign:  fmt.Sprintf("copiergen.Zero[%s]()", typeString(dst, currentPkg)),
 				importTypes: []types.Type{dst},
 			}, true
 		}
@@ -1044,7 +1044,7 @@ func zeroExpr(t types.Type, expr string) string {
 		return expr + " == nil"
 	}
 	if types.Comparable(t) {
-		return fmt.Sprintf("copier.IsZero(%s)", expr)
+		return fmt.Sprintf("copiergen.IsZero(%s)", expr)
 	}
 	return "false"
 }
@@ -1127,6 +1127,9 @@ func generatedFileName(sourceFile string) string {
 func collectImports(m model) map[string]string {
 	imports := map[string]string{"github.com/Alex41/copier-gen": "copier"}
 	for _, pair := range m.pairs {
+		if len(pair.fields) > 0 {
+			imports["github.com/Alex41/copier-gen/runtime"] = "copiergen"
+		}
 		collectTypeImports(imports, pair.srcType, m.pkgPath)
 		collectTypeImports(imports, pair.dstType, m.pkgPath)
 		for _, field := range pair.fields {
@@ -1226,7 +1229,7 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	fmt.Fprintln(b)
 
 	fmt.Fprintf(b, "func init() {\n")
-	fmt.Fprintf(b, "copier.RegisterMapper(func(toValue interface{}, fromValue interface{}, opt copier.Option) (bool, error) {\n")
+	fmt.Fprintf(b, "copier.RegisterMapper(func(toValue, fromValue any, opt copier.Option) (bool, error) {\n")
 	fmt.Fprintf(b, "to, ok := toValue.(*%s)\n", dstType)
 	fmt.Fprintf(b, "if !ok { return false, nil }\n")
 	if pair.fromPtr {
@@ -1246,7 +1249,7 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintln(b, "if !opt.CaseSensitive {")
 	}
 	if field.converter {
-		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
+		fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
 		fmt.Fprintf(b, "converted, err := %s(%s)\n", field.converterFn, field.srcExpr)
 		fmt.Fprintln(b, "if err != nil { return err }")
 		fmt.Fprintf(b, "to.%s = converted\n", field.dstName)
@@ -1256,17 +1259,17 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		for _, nested := range field.nested {
 			renderFieldCopy(b, nested, currentPkg)
 		}
-		fmt.Fprintf(b, "} else if !copier.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
 		fmt.Fprintln(b, "}")
 	} else if field.nilSafe {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
-		fmt.Fprintf(b, "} else if !copier.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
 		fmt.Fprintln(b, "}")
 	} else {
-		fmt.Fprintf(b, "if !copier.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
+		fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
 		fmt.Fprintln(b, "}")
 	}
@@ -1301,7 +1304,7 @@ func converterKey(src, dst types.Type) string {
 }
 
 func mapperName(pair copyPair) string {
-	return "copy" + typeNameForFunc(pair.srcType) + "To" + typeNameForFunc(pair.dstType)
+	return "_copier" + typeNameForFunc(pair.srcType) + "To" + typeNameForFunc(pair.dstType)
 }
 
 func typeNameForFunc(t types.Type) string {
@@ -1341,7 +1344,7 @@ func upperFirst(s string) string {
 	return strings.ToUpper(s[:1]) + s[1:]
 }
 
-func fatalf(format string, args ...interface{}) {
+func fatalf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "copier-gen: "+format+"\n", args...)
 	os.Exit(1)
 }

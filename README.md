@@ -5,8 +5,7 @@ reflection copying is disabled; call generated functions instead.
 
 ## Usage
 
-Add a generator directive to a package that currently calls `copier.Copy` or
-`copier.CopyWithOption`:
+Add a generator directive to a package that currently calls `copier.Copy`:
 
 ```go
 //go:generate go run github.com/Alex41/copier-gen/cmd/copier-gen
@@ -26,13 +25,15 @@ activity.go -> activity_copier_gen.go
 ```
 
 ```go
-func copyUserToEmployee(to *Employee, from User, opt copier.Option) error
+func _copierUserToEmployee(to *Employee, from User, opt copier.Option) error
 ```
 
 Generated mapper functions are private and register themselves in `init()`.
 Existing calls such as
-`copier.CopyWithOption(&dst, src, opt)` dispatch to that generated mapper using
+`copier.Copy(&dst, src, opt)` dispatch to that generated mapper using
 ordinary Go type assertions. No reflection is used.
+Generated files may also import `github.com/Alex41/copier-gen/runtime` for
+small helper functions used only by generated code.
 
 Explicit pairs are still available for tests or manual generation:
 
@@ -53,7 +54,7 @@ func FormatStatus(src RawStatus) (FormattedStatus, error) {
 	return FormattedStatus{Value: src.Value}, nil
 }
 
-err := copier.CopyWithOption(&dst, src, copier.Option{
+err := copier.Copy(&dst, src, copier.Option{
 	Converters: copier.Converters{
 		copier.UseConverter[RawStatus, FormattedStatus](FormatStatus),
 	},
@@ -92,11 +93,10 @@ Supported options:
 Current generator support is intentionally narrow and static:
 
 - same-package struct-to-struct pairs via `-pair Src:Dst`
-- automatic discovery of `copier.Copy` and `copier.CopyWithOption` call sites
+- automatic discovery of `copier.Copy` call sites
 - exported fields
 - direct assignment or Go type conversion
-- registration-backed `Copy` / `CopyWithOption` dispatch without reflection
-- generated typed converter factory per pair
+- registration-backed `Copy` dispatch without reflection
 
 The extension point is the generator pipeline: new field handlers can be added
 where `assignmentExpr`, tag parsing, and pair rendering decide how a field is

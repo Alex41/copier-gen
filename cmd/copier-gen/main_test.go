@@ -35,7 +35,7 @@ type Employee struct {
 
 func Cast(src User) (Employee, error) {
 	var dst Employee
-	err := copier.CopyWithOption(&dst, src, copier.Option{IgnoreEmpty: true})
+	err := copier.Copy(&dst, src, copier.Option{IgnoreEmpty: true})
 	return dst, err
 }
 `
@@ -53,19 +53,22 @@ func Cast(src User) (Employee, error) {
 	}
 	text := string(out)
 	for _, want := range []string{
-		"func copySampleUserToSampleEmployee(to *Employee, from User, opt copier.Option) error",
+		`copiergen "github.com/Alex41/copier-gen/runtime"`,
+		"func _copierSampleUserToSampleEmployee(to *Employee, from User, opt copier.Option) error",
 		"to.FullName = from.Name",
 		"to.Years = from.Age",
 		"if !opt.CaseSensitive",
 		"to.TITLE = from.Title",
 		"to.Required = from.Required",
-		"copier.RegisterMapper(func(toValue interface{}, fromValue interface{}, opt copier.Option) (bool, error)",
+		"copier.RegisterMapper(func(toValue, fromValue any, opt copier.Option) (bool, error)",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
 		}
 	}
-	if strings.Contains(text, "func CopySampleUserToSampleEmployee") || strings.Contains(text, "func New") {
+	if strings.Contains(text, "func copySampleUserToSampleEmployee") ||
+		strings.Contains(text, "func CopySampleUserToSampleEmployee") ||
+		strings.Contains(text, "func New") {
 		t.Fatalf("generated output contains exported helper functions:\n%s", text)
 	}
 	if strings.Contains(text, "to.Secret") {
@@ -96,7 +99,7 @@ type Employee struct {
 
 func Cast(src User) (Employee, error) {
 	var dst Employee
-	err := copier.CopyWithOption(&dst, src, copier.Option{})
+	err := copier.Copy(&dst, src, copier.Option{})
 	return dst, err
 }
 `
@@ -138,7 +141,7 @@ type Employee struct {
 
 func Cast(src User) (Employee, error) {
 	var dst Employee
-	err := copier.CopyWithOption(&dst, src, copier.Option{})
+	err := copier.Copy(&dst, src, copier.Option{})
 	return dst, err
 }
 `
@@ -171,7 +174,7 @@ type Employee struct {
 
 func Cast(src User) (Employee, error) {
 	var dst Employee
-	err := cg.CopyWithOption(&dst, src, cg.Option{})
+	err := cg.Copy(&dst, src, cg.Option{})
 	return dst, err
 }
 `
@@ -204,7 +207,7 @@ type Employee struct {
 
 func Cast(src User) (Employee, error) {
 	var dst Employee
-	err := copier.CopyWithOption(&dst, src, copier.Option{})
+	err := copier.Copy(&dst, src, copier.Option{})
 	return dst, err
 }
 `
@@ -241,7 +244,7 @@ type Wrapper struct {
 
 func Cast(src Source) error {
 	wrapper := &Wrapper{}
-	return copier.CopyWithOption(&wrapper.Destination, src, copier.Option{})
+	return copier.Copy(&wrapper.Destination, src, copier.Option{})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
@@ -276,7 +279,7 @@ type Destination struct {
 
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{IgnoreEmpty: true})
+	return copier.Copy(dst, src, copier.Option{IgnoreEmpty: true})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
@@ -295,7 +298,7 @@ func Cast(src Source) error {
 	for _, want := range []string{
 		"if from.Enabled != nil",
 		"to.Enabled = *from.Enabled",
-		"to.Enabled = copier.Zero[bool]()",
+		"to.Enabled = copiergen.Zero[bool]()",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
@@ -324,7 +327,7 @@ type Destination struct {
 
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{IgnoreEmpty: true})
+	return copier.Copy(dst, src, copier.Option{IgnoreEmpty: true})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
@@ -344,7 +347,7 @@ func Cast(src Source) error {
 		"if from.Notifications != nil",
 		"if from.Notifications.Email != nil",
 		"to.Notifications.Email = *from.Notifications.Email",
-		"to.Notifications = copier.Zero[Notifications[bool]]()",
+		"to.Notifications = copiergen.Zero[Notifications[bool]]()",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
@@ -401,7 +404,7 @@ func ConvertRaw(src Raw) (Formatted, error) {
 
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{
+	return copier.Copy(dst, src, copier.Option{
 		Converters: copier.Converters{
 			copier.UseConverter[Raw, Formatted](ConvertRaw),
 		},
@@ -455,7 +458,7 @@ type Destination struct {
 
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{})
+	return copier.Copy(dst, src, copier.Option{})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
@@ -495,7 +498,7 @@ type Destination struct {
 
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{})
+	return copier.Copy(dst, src, copier.Option{})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
@@ -539,7 +542,7 @@ type Destination struct {
 
 func Cast(src Source) error {
 	dst := &Destination{}
-	return copier.CopyWithOption(dst, src, copier.Option{})
+	return copier.Copy(dst, src, copier.Option{})
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {

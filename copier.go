@@ -2,19 +2,6 @@ package copier
 
 import "sync"
 
-// These flags are used by generated files to preserve copier tag semantics.
-const (
-	tagIgnore uint8 = 1 << iota
-	tagOverride
-
-	// Default values kept for source compatibility with old examples.
-	String  string  = ""
-	Bool    bool    = false
-	Int     int     = 0
-	Float32 float32 = 0
-	Float64 float64 = 0
-)
-
 // Option sets copy options used by generated copy functions.
 type Option struct {
 	IgnoreEmpty   bool
@@ -38,7 +25,7 @@ func UseConverter[S, D any](converter Converter[S, D]) Converter[S, D] {
 
 // Mapper is registered by generated files. It must return handled=false when
 // the argument types do not match its generated mapper.
-type Mapper func(toValue interface{}, fromValue interface{}, opt Option) (handled bool, err error)
+type Mapper func(toValue, fromValue any, opt Option) (handled bool, err error)
 
 var (
 	mappersMu sync.RWMutex
@@ -57,31 +44,13 @@ func Convert[S, D any](src S, converter Converter[S, D]) (D, error) {
 	return converter(src)
 }
 
-// IsZero is used by generated files.
-func IsZero[T comparable](v T) bool {
-	var zero T
-	return v == zero
-}
-
-// Zero is used by generated files.
-func Zero[T any]() T {
-	var zero T
-	return zero
-}
-
-// ShouldIgnoreEmpty mirrors copier:"override" behavior for generated code.
-func ShouldIgnoreEmpty(isZero bool, flags uint8, opt Option) bool {
-	return opt.IgnoreEmpty && flags&tagOverride == 0 && isZero
-}
-
-// Copy dispatches to generated typed mappers. It does not use reflection.
-func Copy(toValue interface{}, fromValue interface{}) error {
-	return CopyWithOption(toValue, fromValue, Option{})
-}
-
-// CopyWithOption dispatches to generated typed mappers. It does not use
-// reflection; generated mappers use ordinary Go type assertions.
-func CopyWithOption(toValue interface{}, fromValue interface{}, opt Option) error {
+// Copy dispatches to generated typed mappers. It does not use reflection;
+// generated mappers use ordinary Go type assertions.
+func Copy(toValue, fromValue any, opts ...Option) error {
+	opt := Option{}
+	if len(opts) > 0 {
+		opt = opts[0]
+	}
 	mappersMu.RLock()
 	defer mappersMu.RUnlock()
 	for _, mapper := range mappers {
