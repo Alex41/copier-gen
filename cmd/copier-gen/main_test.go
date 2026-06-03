@@ -425,8 +425,69 @@ func Cast(src Source) error {
 	}
 	text := string(out)
 	for _, want := range []string{
-		"converted, err := ConvertRaw(from.Status)",
+		"converter, ok := copier.FindConverter[Raw, Formatted](opt.Converters)",
+		"if !ok {",
+		"converted, err := converter(from.Status)",
 		"to.Status = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderUsesInferredElementConverterForSliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Points []*Raw
+}
+
+type Destination struct {
+	Points []Formatted
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Converters: copier.Converters{
+			copier.UseConverter(func(s *Raw) (Formatted, error) {
+				return Formatted{Label: s.Value}, nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverter[*Raw, Formatted](opt.Converters)",
+		"converted = make([]Formatted, 0, len(from.Points))",
+		"for _, item := range from.Points",
+		"convertedItem, err := converter(item)",
+		"to.Points = converted",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)

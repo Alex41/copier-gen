@@ -23,6 +23,17 @@ func UseConverter[S, D any](converter Converter[S, D]) Converter[S, D] {
 	return converter
 }
 
+// FindConverter returns a typed converter from the current Copy options.
+func FindConverter[S, D any](converters Converters) (Converter[S, D], bool) {
+	for _, candidate := range converters {
+		converter, ok := candidate.(Converter[S, D])
+		if ok {
+			return converter, true
+		}
+	}
+	return nil, false
+}
+
 // Mapper is registered by generated files. It must return handled=false when
 // the argument types do not match its generated mapper.
 type Mapper func(toValue, fromValue any, opt Option) (handled bool, err error)
