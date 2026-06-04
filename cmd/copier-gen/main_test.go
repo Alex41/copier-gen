@@ -681,6 +681,64 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderCopiesFieldsFromEmbeddedSourceStruct(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type EditCore struct {
+	Title *string
+	Skip *string ` + "`copier:\"-\"`" + `
+}
+
+type Source struct {
+	EditCore ` + "`json:\",inline\"`" + `
+	Enabled *bool
+}
+
+type Destination struct {
+	Title string
+	Skip string
+	Enabled bool
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		IgnoreEmpty: true,
+		DeepCopy: true,
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.EditCore.Title != nil",
+		"to.Title = *from.EditCore.Title",
+		"if from.Enabled != nil",
+		"to.Enabled = *from.Enabled",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "from.EditCore.Skip") || strings.Contains(text, "to.Skip") {
+		t.Fatalf("generated output copied ignored embedded field:\n%s", text)
+	}
+}
+
 func TestRenderDeepCopySliceField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
