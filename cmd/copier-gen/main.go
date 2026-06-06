@@ -42,6 +42,8 @@ type model struct {
 	pkgName    string
 	pkgPath    string
 	pairs      []copyPair
+	nested     []nestedMapper
+	nestedSet  bool
 	imports    map[string]string
 	issues     []string
 	converters map[string]staticConverter
@@ -69,6 +71,13 @@ type copyPair struct {
 	converters   map[string]staticConverter
 	sourceFile   string
 	discoveredAt string
+}
+
+type nestedMapper struct {
+	name    string
+	srcType types.Type
+	dstType types.Type
+	fields  []fieldCopy
 }
 
 type fieldCopy struct {
@@ -859,7 +868,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 		}
 
 		if pair.deepCopy && needsDeepCopy(srcField.field.Type()) {
-			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg); ok {
+			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters); ok {
 				pair.fields = append(pair.fields, field)
 				continue
 			}
@@ -877,7 +886,9 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 
 		assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), "from."+srcField.expr, currentPkg)
 		if !ok {
-			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopies(srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg)
+			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopies(
+				srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg, converters,
+			)
 			if !nestedOK {
 				if converter, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
 					pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter))
@@ -902,6 +913,10 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 
 func converterFieldCopy(srcField sourceField, dstField *types.Var, flags uint8, insensitive bool, converter staticConverter) fieldCopy {
 	field := baseFieldCopy(srcField, dstField, flags, insensitive)
+	return applyConverter(field, converter)
+}
+
+func applyConverter(field fieldCopy, converter staticConverter) fieldCopy {
 	field.converter = true
 	field.converterFn = converter.fn
 	field.converterSrcType = converter.srcType
@@ -986,9 +1001,18 @@ func nestedCopyField(
 	return field
 }
 
-func deepFieldCopy(srcField sourceField, dstField *types.Var, flags uint8, insensitive bool, currentPkg string) (fieldCopy, bool) {
+func deepFieldCopy(
+	srcField sourceField,
+	dstField *types.Var,
+	flags uint8,
+	insensitive bool,
+	currentPkg string,
+	converters map[string]staticConverter,
+) (fieldCopy, bool) {
 	srcExpr := "from." + srcField.expr
-	if nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(srcField.field.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg); ok {
+	if nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(
+		srcField.field.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg, converters,
+	); ok {
 		return nestedCopyField(srcField, dstField, flags, insensitive, nested, nestedPtr, nestedAlloc, currentPkg), true
 	}
 	if assign, ok := pointerDeepAssignment(srcField.field.Type(), dstField.Type(), srcExpr, currentPkg); ok {
@@ -1056,11 +1080,20 @@ func sliceDeepAssignment(src, dst types.Type, currentPkg string) (assignment, bo
 	return assign, ok
 }
 
-func nestedFieldCopies(src, dst types.Type, srcExpr, dstPrefix, currentPkg string) ([]fieldCopy, bool, string, bool) {
-	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, 0)
+func nestedFieldCopies(
+	src, dst types.Type,
+	srcExpr, dstPrefix, currentPkg string,
+	converters map[string]staticConverter,
+) ([]fieldCopy, bool, string, bool) {
+	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, converters, 0)
 }
 
-func nestedFieldCopiesDepth(src, dst types.Type, srcExpr, dstPrefix, currentPkg string, depth int) ([]fieldCopy, bool, string, bool) {
+func nestedFieldCopiesDepth(
+	src, dst types.Type,
+	srcExpr, dstPrefix, currentPkg string,
+	converters map[string]staticConverter,
+	depth int,
+) ([]fieldCopy, bool, string, bool) {
 	if depth > 8 {
 		return nil, false, "", false
 	}
@@ -1094,9 +1127,17 @@ func nestedFieldCopiesDepth(src, dst types.Type, srcExpr, dstPrefix, currentPkg 
 			continue
 		}
 		source := srcExpr + "." + srcField.Name()
+		if converter, ok := converters[converterKey(srcField.Type(), dstField.Type())]; ok {
+			field := baseFieldCopyValues(srcField.Name(), source, srcField.Type(), dstField, 0, false)
+			field.dstName = dstPrefix + "." + dstField.Name()
+			fields = append(fields, applyConverter(field, converter))
+			continue
+		}
 		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), source, currentPkg)
 		if !ok {
-			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(srcField.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, depth+1)
+			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(
+				srcField.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, depth+1,
+			)
 			if !nestedOK {
 				return nil, false, "", false
 			}
@@ -1374,9 +1415,17 @@ func render(m model) ([]byte, error) {
 	fmt.Fprintf(&b, "package %s\n\n", m.pkgName)
 	fmt.Fprintf(&b, "// Code generated by copier-gen; DO NOT EDIT.\n\n")
 	renderImports(&b, imports)
+	nested := m.nested
+	if !m.nestedSet {
+		nested = collectNestedMappers(m)
+	}
+	for _, mapper := range nested {
+		renderNestedMapper(&b, mapper, m.pkgPath)
+	}
 	for _, pair := range m.pairs {
 		renderPair(&b, pair, m.pkgPath)
 	}
+	renderMapperRegistrations(&b, m.pairs, m.pkgPath)
 
 	formatted, err := format.Source(b.Bytes())
 	if err != nil {
@@ -1423,6 +1472,26 @@ func groupModelByOutput(m model) map[string]model {
 			next = model{pkgName: m.pkgName, pkgPath: m.pkgPath, imports: map[string]string{}}
 		}
 		next.pairs = append(next.pairs, pair)
+		grouped[output] = next
+	}
+	outputs := make([]string, 0, len(grouped))
+	for output := range grouped {
+		outputs = append(outputs, output)
+	}
+	sort.Strings(outputs)
+
+	owned := map[string]bool{}
+	for _, output := range outputs {
+		next := grouped[output]
+		next.nestedSet = true
+		for _, mapper := range collectNestedMappers(next) {
+			key := nestedMapperKey(mapper.srcType, mapper.dstType, mapper.fields)
+			if owned[key] {
+				continue
+			}
+			owned[key] = true
+			next.nested = append(next.nested, mapper)
+		}
 		grouped[output] = next
 	}
 	return grouped
@@ -1514,6 +1583,83 @@ func uniqueImportName(imports map[string]string, base string) string {
 	}
 }
 
+func collectNestedMappers(m model) []nestedMapper {
+	byKey := map[string]nestedMapper{}
+	var collect func(field fieldCopy)
+	collect = func(field fieldCopy) {
+		if len(field.nested) == 0 {
+			return
+		}
+		fields := normalizeNestedFields(field.nested, field.srcExpr, field.dstName)
+		key := nestedMapperKey(field.srcType, field.dstType, fields)
+		if _, ok := byKey[key]; !ok {
+			byKey[key] = nestedMapper{
+				name:    nestedMapperName(field.srcType, field.dstType, fields),
+				srcType: field.srcType,
+				dstType: field.dstType,
+				fields:  fields,
+			}
+		}
+		for _, child := range field.nested {
+			collect(child)
+		}
+	}
+	for _, pair := range m.pairs {
+		for _, field := range pair.fields {
+			collect(field)
+		}
+	}
+
+	mappers := make([]nestedMapper, 0, len(byKey))
+	for _, mapper := range byKey {
+		mappers = append(mappers, mapper)
+	}
+	sort.Slice(mappers, func(i, j int) bool {
+		return mappers[i].name < mappers[j].name
+	})
+	return mappers
+}
+
+func normalizeNestedFields(fields []fieldCopy, srcPrefix, dstPrefix string) []fieldCopy {
+	normalized := make([]fieldCopy, 0, len(fields))
+	for _, field := range fields {
+		next := field
+		next.srcExpr = replaceExpressionRoot(field.srcExpr, srcPrefix, "from")
+		next.zeroExpr = replaceExpressionRoot(field.zeroExpr, srcPrefix, "from")
+		next.assignExpr = replaceExpressionRoot(field.assignExpr, srcPrefix, "from")
+		next.dstName = strings.TrimPrefix(field.dstName, dstPrefix+".")
+		next.nested = normalizeNestedFields(field.nested, srcPrefix, dstPrefix)
+		normalized = append(normalized, next)
+	}
+	return normalized
+}
+
+func replaceExpressionRoot(expr, oldRoot, newRoot string) string {
+	if expr == oldRoot {
+		return newRoot
+	}
+	expr = strings.ReplaceAll(expr, oldRoot+".", newRoot+".")
+	return strings.ReplaceAll(expr, oldRoot+" ", newRoot+" ")
+}
+
+func renderNestedMapper(b *bytes.Buffer, mapper nestedMapper, currentPkg string) {
+	dstType := typeString(mapper.dstType, currentPkg)
+	toType := dstType
+	if _, ok := mapper.dstType.(*types.Pointer); !ok {
+		toType = "*" + dstType
+	}
+	fmt.Fprintf(b, "func %s(to %s, from %s, opt copier.Option) error {\n",
+		mapper.name, toType, typeString(mapper.srcType, currentPkg))
+	fmt.Fprintln(b, "if to == nil { return copier.ErrInvalidCopyDestination }")
+	fmt.Fprintln(b, "if from == nil { return copier.ErrInvalidCopyFrom }")
+	for _, field := range mapper.fields {
+		renderFieldCopy(b, field, currentPkg)
+	}
+	fmt.Fprintln(b, "return nil")
+	fmt.Fprintln(b, "}")
+	fmt.Fprintln(b)
+}
+
 func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	sort.Slice(pair.fields, func(i, j int) bool {
 		return pair.fields[i].dstName < pair.fields[j].dstName
@@ -1551,8 +1697,24 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	fmt.Fprintln(b, "return nil")
 	fmt.Fprintln(b, "}")
 	fmt.Fprintln(b)
+}
 
-	fmt.Fprintf(b, "func init() {\n")
+func renderMapperRegistrations(b *bytes.Buffer, pairs []copyPair, currentPkg string) {
+	if len(pairs) == 0 {
+		return
+	}
+	fmt.Fprintln(b, "func init() {")
+	for _, pair := range pairs {
+		renderMapperRegistration(b, pair, currentPkg)
+	}
+	fmt.Fprintln(b, "}")
+	fmt.Fprintln(b)
+}
+
+func renderMapperRegistration(b *bytes.Buffer, pair copyPair, currentPkg string) {
+	fn := mapperName(pair)
+	dstType := typeString(pair.dstType, currentPkg)
+	srcType := typeString(pair.srcType, currentPkg)
 	fmt.Fprintf(b, "copier.RegisterMapper(func(toValue, fromValue any, opt copier.Option) (bool, error) {\n")
 	if pair.toIndirect {
 		fmt.Fprintf(b, "to, ok := toValue.(**%s)\n", dstType)
@@ -1568,8 +1730,6 @@ func renderPair(b *bytes.Buffer, pair copyPair, currentPkg string) {
 	fmt.Fprintf(b, "if !ok { return false, nil }\n")
 	fmt.Fprintf(b, "return true, %s(to, from, opt)\n", fn)
 	fmt.Fprintf(b, "})\n")
-	fmt.Fprintf(b, "}\n")
-	fmt.Fprintln(b)
 }
 
 func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
@@ -1599,12 +1759,16 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintln(b, "}")
 	} else if len(field.nested) > 0 {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		toExpr := "&to." + field.dstName
 		if field.nestedPtr {
 			fmt.Fprintf(b, "to.%s = new(%s)\n", field.dstName, field.nestedAlloc)
+			toExpr = "to." + field.dstName
 		}
-		for _, nested := range field.nested {
-			renderFieldCopy(b, nested, currentPkg)
-		}
+		fmt.Fprintf(b, "if err := %s(%s, %s, opt); err != nil { return err }\n",
+			nestedMapperNameForField(field),
+			toExpr,
+			field.srcExpr,
+		)
 		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
 		fmt.Fprintln(b, "}")
@@ -1677,8 +1841,51 @@ func copyPairKey(pair copyPair) string {
 }
 
 func mapperName(pair copyPair) string {
-	hash := sha256.Sum256([]byte(copyPairKey(pair)))
+	hash := sha256.Sum256([]byte("mapper:" + copyPairKey(pair)))
 	return fmt.Sprintf("_copier_%x", hash[:8])
+}
+
+func nestedMapperKey(src, dst types.Type, fields []fieldCopy) string {
+	var plan strings.Builder
+	writeFieldPlan(&plan, fields)
+	return typeKey(src) + "->" + typeKey(dst) + ":" + plan.String()
+}
+
+func writeFieldPlan(plan *strings.Builder, fields []fieldCopy) {
+	for _, field := range fields {
+		fmt.Fprintf(
+			plan,
+			"%s|%s|%s|%s|%d|%t|%t|%t|%t|%t|%s|%s|",
+			field.srcExpr,
+			field.dstName,
+			typeKey(field.srcType),
+			typeKey(field.dstType),
+			field.flags,
+			field.nilSafe,
+			field.ptrCopy,
+			field.sliceCopy,
+			field.converter,
+			field.slice,
+			field.assignExpr,
+			field.zeroAssign,
+		)
+		if field.converter {
+			fmt.Fprintf(plan, "%s|%s|", typeKey(field.converterSrcType), typeKey(field.converterDstType))
+		}
+		plan.WriteByte('{')
+		writeFieldPlan(plan, field.nested)
+		plan.WriteString("};")
+	}
+}
+
+func nestedMapperName(src, dst types.Type, fields []fieldCopy) string {
+	hash := sha256.Sum256([]byte("nested:" + nestedMapperKey(src, dst, fields)))
+	return fmt.Sprintf("_copier_%x", hash[:8])
+}
+
+func nestedMapperNameForField(field fieldCopy) string {
+	fields := normalizeNestedFields(field.nested, field.srcExpr, field.dstName)
+	return nestedMapperName(field.srcType, field.dstType, fields)
 }
 
 var nonIdentifier = regexp.MustCompile(`[^a-zA-Z0-9_]`)

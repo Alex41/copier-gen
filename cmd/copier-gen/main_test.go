@@ -412,6 +412,62 @@ func CastIndirect(dst **Destination, src Source) error {
 	}
 }
 
+func TestRenderUsesSingleInitForAllMappersInFile(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type FirstSource struct {
+	Name string
+}
+
+type FirstDestination struct {
+	Name string
+}
+
+type SecondSource struct {
+	Count int
+}
+
+type SecondDestination struct {
+	Count int
+}
+
+func CopyFirst(dst *FirstDestination, src FirstSource) error {
+	return copier.Copy(dst, src)
+}
+
+func CopySecond(dst *SecondDestination, src SecondSource) error {
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	if count := strings.Count(text, "func init()"); count != 1 {
+		t.Fatalf("generated %d init functions, want 1:\n%s", count, text)
+	}
+	if count := strings.Count(text, "copier.RegisterMapper("); count != 2 {
+		t.Fatalf("generated %d mapper registrations, want 2:\n%s", count, text)
+	}
+	for _, pair := range m.pairs {
+		if !strings.Contains(text, "return true, "+mapperName(pair)+"(to, from, opt)") {
+			t.Fatalf("generated init does not register %s:\n%s", mapperName(pair), text)
+		}
+	}
+}
+
 func TestMapperNameIsStableHash(t *testing.T) {
 	pair := copyPair{
 		srcType: types.Typ[types.String],
@@ -510,10 +566,14 @@ func Cast(src Source) error {
 		t.Fatalf("render returned error: %v", err)
 	}
 	text := string(out)
+	nested := m.pairs[0].fields[0]
+	helper := nestedMapperNameForField(nested)
 	for _, want := range []string{
 		"if from.Notifications != nil",
-		"if from.Notifications.Email != nil",
-		"to.Notifications.Email = *from.Notifications.Email",
+		"func " + helper + "(to *Notifications[bool], from *Notifications[*bool], opt copier.Option) error",
+		"if from.Email != nil",
+		"to.Email = *from.Email",
+		helper + "(&to.Notifications, from.Notifications, opt)",
 		"to.Notifications = copiergen.Zero[Notifications[bool]]()",
 	} {
 		if !strings.Contains(text, want) {
@@ -559,16 +619,273 @@ func Cast(src Source) error {
 		t.Fatalf("render returned error: %v", err)
 	}
 	text := string(out)
+	nested := m.pairs[0].fields[0]
+	helper := nestedMapperNameForField(nested)
 	for _, want := range []string{
 		"if from.FileLimit != nil",
 		"to.FileLimit = new(Range[uint8])",
-		"to.FileLimit.From = uint8(from.FileLimit.From)",
-		"to.FileLimit.To = uint8(from.FileLimit.To)",
+		"func " + helper + "(to *Range[uint8], from *Range[uint], opt copier.Option) error",
+		"to.From = uint8(from.From)",
+		"to.To = uint8(from.To)",
+		helper + "(to.FileLimit, from.FileLimit, opt)",
 		"to.FileLimit = copiergen.Zero[*Range[uint8]]()",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRenderReusesNestedMapperForMatchingFieldTypes(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type NestedSource struct {
+	Name *string
+	Count *int
+}
+
+type NestedDestination struct {
+	Name string
+	Count int
+}
+
+type Source struct {
+	Primary *NestedSource
+	Secondary *NestedSource
+}
+
+type Destination struct {
+	Primary NestedDestination
+	Secondary NestedDestination
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.pairs) != 1 || len(m.pairs[0].fields) != 2 {
+		t.Fatalf("unexpected generated model: %+v", m.pairs)
+	}
+	helper := nestedMapperNameForField(m.pairs[0].fields[0])
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	if count := strings.Count(text, "func "+helper+"("); count != 1 {
+		t.Fatalf("generated nested helper %d times, want 1:\n%s", count, text)
+	}
+	for _, want := range []string{
+		helper + "(&to.Primary, from.Primary, opt)",
+		helper + "(&to.Secondary, from.Secondary, opt)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if count := strings.Count(text, "to.Name = *from.Name"); count != 1 {
+		t.Fatalf("nested field body generated %d times, want 1:\n%s", count, text)
+	}
+}
+
+func TestWriteGeneratedFilesDeclaresNestedMapperOncePerPackage(t *testing.T) {
+	dir := t.TempDir()
+	typesSource := `package sample
+
+type NestedSource struct {
+	Name *string
+}
+
+type NestedDestination struct {
+	Name string
+}
+
+type FirstSource struct {
+	Nested *NestedSource
+}
+
+type FirstDestination struct {
+	Nested NestedDestination
+}
+
+type SecondSource struct {
+	Nested *NestedSource
+}
+
+type SecondDestination struct {
+	Nested NestedDestination
+}
+`
+	firstSource := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+func CopyFirst(dst *FirstDestination, src FirstSource) error {
+	return copier.Copy(dst, src)
+}
+`
+	secondSource := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+func CopySecond(dst *SecondDestination, src SecondSource) error {
+	return copier.Copy(dst, src)
+}
+`
+	for name, src := range map[string]string{
+		"types.go":  typesSource,
+		"first.go":  firstSource,
+		"second.go": secondSource,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(src), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if err := writeGeneratedFiles(dir, "", m); err != nil {
+		t.Fatalf("writeGeneratedFiles returned error: %v", err)
+	}
+
+	helper := nestedMapperNameForField(m.pairs[0].fields[0])
+	var declarations, calls int
+	for _, name := range []string{"first_copier_gen.go", "second_copier_gen.go"} {
+		src, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(src)
+		declarations += strings.Count(text, "func "+helper+"(")
+		calls += strings.Count(text, helper+"(")
+	}
+	if declarations != 1 {
+		t.Fatalf("nested helper declared %d times across generated package, want 1", declarations)
+	}
+	if calls != 3 {
+		t.Fatalf("nested helper referenced %d times including its declaration, want 3", calls)
+	}
+}
+
+func TestRenderNestedMapperUsesCallScopedConverter(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type NestedSource struct {
+	Value Raw
+}
+
+type NestedDestination struct {
+	Value string
+}
+
+type Source struct {
+	Nested *NestedSource
+}
+
+type Destination struct {
+	Nested NestedDestination
+}
+
+func ConvertRaw(src Raw) (string, error) {
+	return src.Value, nil
+}
+
+func Cast(dst *Destination, src Source) error {
+	return copier.Copy(dst, src, copier.Option{
+		Converters: copier.Converters{
+			copier.UseConverter(ConvertRaw),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	helper := nestedMapperNameForField(m.pairs[0].fields[0])
+	for _, want := range []string{
+		"func " + helper + "(to *NestedDestination, from *NestedSource, opt copier.Option) error",
+		"converter, ok := copier.FindConverter[Raw, string](opt.Converters)",
+		"converted, err := converter(from.Value)",
+		"to.Value = converted",
+		helper + "(&to.Nested, from.Nested, opt)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestLoadModelFailsWhenNestedMapperConverterIsMissing(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type NestedSource struct {
+	Value Raw
+}
+
+type NestedDestination struct {
+	Value string
+}
+
+type Source struct {
+	Nested *NestedSource
+}
+
+type Destination struct {
+	Nested NestedDestination
+}
+
+func Cast(dst *Destination, src Source) error {
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadModel(dir, nil)
+	if err == nil {
+		t.Fatal("loadModel succeeded without required nested converter")
+	}
+	if !strings.Contains(err.Error(), "field Nested needs converter") {
+		t.Fatalf("error does not explain missing nested converter: %v", err)
 	}
 }
 

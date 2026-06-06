@@ -186,6 +186,15 @@ falling back to shallow assignment.
 - mapper functions use deterministic private names in the form
   `_copier_<16-hex-hash>`; the hash includes source and destination pointer
   forms
+- repeated nested mappings are emitted as one private typed helper per package;
+  exactly one generated file owns the declaration and other generated files
+  call it
+- nested helper hashes include the normalized mapping plan, so mappings with
+  different converter requirements do not share an incompatible helper
+- nested helpers receive the current `Option` and resolve converters only from
+  that `Copy` call's `Option.Converters`
+- each generated file contains at most one `init()` function; it registers all
+  top-level mappers emitted into that file
 - generated code does not use reflection
 - all output files are rendered before any file is written
 - one unresolved `copier.Copy` call fails the whole run
