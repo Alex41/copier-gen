@@ -263,6 +263,94 @@ func Cast(src Source) error {
 	}
 }
 
+func TestLoadModelFailsIfAnyDestinationIsNotWritablePointer(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string
+}
+
+func Valid(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+
+func Invalid(src Source) error {
+	var dst Destination
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadModel(dir, nil)
+	if err == nil {
+		t.Fatal("loadModel succeeded with a non-pointer destination")
+	}
+	for _, want := range []string{
+		"found copier calls that cannot be generated",
+		"destination argument must be a writable pointer to a named struct",
+		"sample.go:",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error does not contain %q: %v", want, err)
+		}
+	}
+}
+
+func TestRenderSupportsPointerToPointerDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(&dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"func _copierSampleSourceToSampleDestination(toValue **Destination, from Source, opt copier.Option) error",
+		"if toValue == nil || *toValue == nil",
+		"to := *toValue",
+		"to.Name = from.Name",
+		"to, ok := toValue.(**Destination)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestRenderPointerSourceToValueDestination(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
