@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"flag"
 	"fmt"
@@ -185,7 +186,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 		return model{}, generationError{err: copyDiscoveryError(issues)}
 	}
 	for _, pair := range discovered {
-		key := typeKey(pair.srcType) + "->" + typeKey(pair.dstType)
+		key := copyPairKey(pair)
 		if seen[key] {
 			continue
 		}
@@ -202,7 +203,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 		if err != nil {
 			return model{}, err
 		}
-		key := typeKey(pair.srcType) + "->" + typeKey(pair.dstType)
+		key := copyPairKey(pair)
 		if !seen[key] {
 			seen[key] = true
 			m.pairs = append(m.pairs, pair)
@@ -256,7 +257,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 		return model{}, copyDiscoveryError(issues)
 	}
 	for _, pair := range discovered {
-		key := typeKey(pair.srcType) + "->" + typeKey(pair.dstType)
+		key := copyPairKey(pair)
 		if seen[key] {
 			continue
 		}
@@ -274,7 +275,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 		if err != nil {
 			return model{}, err
 		}
-		key := typeKey(pair.srcType) + "->" + typeKey(pair.dstType)
+		key := copyPairKey(pair)
 		if !seen[key] {
 			seen[key] = true
 			m.pairs = append(m.pairs, pair)
@@ -1665,25 +1666,19 @@ func converterKey(src, dst types.Type) string {
 	return typeKey(src) + "->" + typeKey(dst)
 }
 
-func mapperName(pair copyPair) string {
-	return "_copier" + typeNameForFunc(pair.srcType) + "To" + typeNameForFunc(pair.dstType)
+func copyPairKey(pair copyPair) string {
+	return fmt.Sprintf(
+		"%t:%s->%t:%s",
+		pair.fromPtr,
+		typeKey(pair.srcType),
+		pair.toIndirect,
+		typeKey(pair.dstType),
+	)
 }
 
-func typeNameForFunc(t types.Type) string {
-	named, ok := t.(*types.Named)
-	if !ok {
-		return sanitizeIdentifier(types.TypeString(t, func(pkg *types.Package) string {
-			if pkg == nil {
-				return ""
-			}
-			return pkg.Name()
-		}))
-	}
-	prefix := ""
-	if pkg := named.Obj().Pkg(); pkg != nil {
-		prefix = sanitizeIdentifier(pkg.Name())
-	}
-	return upperFirst(prefix) + upperFirst(sanitizeIdentifier(named.Obj().Name()))
+func mapperName(pair copyPair) string {
+	hash := sha256.Sum256([]byte(copyPairKey(pair)))
+	return fmt.Sprintf("_copier_%x", hash[:8])
 }
 
 var nonIdentifier = regexp.MustCompile(`[^a-zA-Z0-9_]`)
@@ -1697,13 +1692,6 @@ func sanitizeIdentifier(s string) string {
 		return "_" + s
 	}
 	return s
-}
-
-func upperFirst(s string) string {
-	if s == "" {
-		return s
-	}
-	return strings.ToUpper(s[:1]) + s[1:]
 }
 
 func fatalf(format string, args ...any) {

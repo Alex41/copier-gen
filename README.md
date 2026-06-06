@@ -183,7 +183,9 @@ falling back to shallow assignment.
 ## Generation Guarantees
 
 - generated file names follow `<source>_copier_gen.go`
-- mapper functions are private and start with `_copier`
+- mapper functions use deterministic private names in the form
+  `_copier_<16-hex-hash>`; the hash includes source and destination pointer
+  forms
 - generated code does not use reflection
 - all output files are rendered before any file is written
 - one unresolved `copier.Copy` call fails the whole run

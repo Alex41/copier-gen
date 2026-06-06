@@ -5,6 +5,7 @@ import (
 	"go/types"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -52,9 +53,10 @@ func Cast(src User) (Employee, error) {
 		t.Fatalf("render returned error: %v", err)
 	}
 	text := string(out)
+	mapper := mapperName(m.pairs[0])
 	for _, want := range []string{
 		`copiergen "github.com/Alex41/copier-gen/runtime"`,
-		"func _copierSampleUserToSampleEmployee(to *Employee, from User, opt copier.Option) error",
+		"func " + mapper + "(to *Employee, from User, opt copier.Option) error",
 		"to.FullName = from.Name",
 		"to.Years = from.Age",
 		"if !opt.CaseSensitive",
@@ -338,8 +340,9 @@ func Cast(src Source) error {
 		t.Fatalf("render returned error: %v", err)
 	}
 	text := string(out)
+	mapper := mapperName(m.pairs[0])
 	for _, want := range []string{
-		"func _copierSampleSourceToSampleDestination(toValue **Destination, from Source, opt copier.Option) error",
+		"func " + mapper + "(toValue **Destination, from Source, opt copier.Option) error",
 		"if toValue == nil || *toValue == nil",
 		"to := *toValue",
 		"to.Name = from.Name",
@@ -348,6 +351,82 @@ func Cast(src Source) error {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
 		}
+	}
+}
+
+func TestRenderKeepsPointerAndPointerToPointerDestinations(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string
+}
+
+func CastDirect(dst *Destination, src Source) error {
+	return copier.Copy(dst, src)
+}
+
+func CastIndirect(dst **Destination, src Source) error {
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.pairs) != 2 {
+		t.Fatalf("generated %d pairs, want 2", len(m.pairs))
+	}
+	directMapper := mapperName(m.pairs[0])
+	indirectMapper := mapperName(m.pairs[1])
+	if m.pairs[0].toIndirect {
+		directMapper, indirectMapper = indirectMapper, directMapper
+	}
+	if directMapper == indirectMapper {
+		t.Fatalf("direct and indirect destinations have the same mapper name %q", directMapper)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"func " + directMapper + "(to *Destination, from Source, opt copier.Option) error",
+		"to, ok := toValue.(*Destination)",
+		"func " + indirectMapper + "(toValue **Destination, from Source, opt copier.Option) error",
+		"to, ok := toValue.(**Destination)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestMapperNameIsStableHash(t *testing.T) {
+	pair := copyPair{
+		srcType: types.Typ[types.String],
+		dstType: types.Typ[types.Int],
+	}
+	name := mapperName(pair)
+	if !regexp.MustCompile(`^_copier_[0-9a-f]{16}$`).MatchString(name) {
+		t.Fatalf("mapper name %q is not a private 64-bit hash name", name)
+	}
+	if mapperName(pair) != name {
+		t.Fatal("mapper name is not stable")
+	}
+	pair.toIndirect = true
+	if mapperName(pair) == name {
+		t.Fatal("destination indirection is not included in mapper hash")
 	}
 }
 
