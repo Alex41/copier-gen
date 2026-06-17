@@ -106,8 +106,12 @@ func FormatStatus(src RawStatus) (FormattedStatus, error) {
 }
 
 err := copier.Copy(&dst, src, copier.Option{
+	Context: ctx,
 	Converters: copier.Converters{
 		copier.UseConverter[RawStatus, FormattedStatus](FormatStatus),
+		copier.UseConverterContext(func(ctx context.Context, src RawImage) (Image, error) {
+			return LoadImage(ctx, src)
+		}),
 	},
 })
 ```
@@ -120,6 +124,11 @@ Converter rules:
 - an exact converter has priority over direct assignment and Go conversion
 - `UseConverter[Src, Dst](Fn)` and inferred
   `UseConverter(func(Src) (Dst, error) {...})` are supported
+- `UseConverterContext[Src, Dst](Fn)` and inferred
+  `UseConverterContext(func(context.Context, Src) (Dst, error) {...})` are
+  supported
+- context-aware converters receive `Option.Context`; `Copy` uses
+  `context.Background()` when no context is provided
 - element converters can generate slice mappings such as `[]Src -> []Dst`
 - generated code performs a typed lookup in the current call's
   `opt.Converters`; it does not use reflection
@@ -147,6 +156,7 @@ Supported options:
 | `CaseSensitive` | Disable generated case-insensitive fallback matches. |
 | `DeepCopy` | Generate deep copies for supported pointer/slice/nested fields; generation fails when a field would need unsupported deep copy. |
 | `Converters` | Generation-time typed converter markers used to emit typed converter calls. |
+| `Context` | Per-call context passed to `UseConverterContext` converters. |
 
 ## Deep Copy Rules
 

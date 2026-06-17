@@ -796,7 +796,7 @@ type NestedSource struct {
 }
 
 type NestedDestination struct {
-	Value string
+	Value *string
 }
 
 type Source struct {
@@ -837,7 +837,7 @@ func Cast(dst *Destination, src Source) error {
 		"func " + helper + "(to *NestedDestination, from *NestedSource, opt copier.Option) error",
 		"converter, ok := copier.FindConverter[Raw, string](opt.Converters)",
 		"converted, err := converter(from.Value)",
-		"to.Value = converted",
+		"to.Value = &converted",
 		helper + "(&to.Nested, from.Nested, opt)",
 	} {
 		if !strings.Contains(text, want) {
@@ -963,6 +963,191 @@ func Cast(src Source) error {
 		"if !ok {",
 		"converted, err := converter(from.Status)",
 		"to.Status = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderUsesTypedContextConverterForIncompatibleField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import (
+	"context"
+
+	copier "github.com/Alex41/copier-gen"
+)
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Status Raw
+}
+
+type Destination struct {
+	Status Formatted
+}
+
+func ConvertRaw(ctx context.Context, src Raw) (Formatted, error) {
+	return Formatted{Label: src.Value}, nil
+}
+
+func Cast(ctx context.Context, src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Context: ctx,
+		Converters: copier.Converters{
+			copier.UseConverterContext[Raw, Formatted](ConvertRaw),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverterContext[Raw, Formatted](opt.Converters)",
+		"converted, err := converter(opt.Context, from.Status)",
+		"to.Status = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "FindConverter[Raw, Formatted]") ||
+		strings.Contains(text, "converter(from.Status)") {
+		t.Fatalf("generated output used ordinary converter path:\n%s", text)
+	}
+}
+
+func TestRenderInfersContextConverterTypes(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import (
+	"context"
+
+	copier "github.com/Alex41/copier-gen"
+)
+
+type Raw struct {
+	Value string
+}
+
+type Source struct {
+	Status Raw
+}
+
+type Destination struct {
+	Status string
+}
+
+func Cast(ctx context.Context, src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Context: ctx,
+		Converters: copier.Converters{
+			copier.UseConverterContext(func(ctx context.Context, src Raw) (string, error) {
+				return src.Value, nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverterContext[Raw, string](opt.Converters)",
+		"converted, err := converter(opt.Context, from.Status)",
+		"to.Status = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderUsesValueConverterForPointerDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Status Raw
+}
+
+type Destination struct {
+	Status *Formatted
+}
+
+func ConvertRaw(src Raw) (Formatted, error) {
+	return Formatted{Label: src.Value}, nil
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Converters: copier.Converters{
+			copier.UseConverter[Raw, Formatted](ConvertRaw),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverter[Raw, Formatted](opt.Converters)",
+		"converted, err := converter(from.Status)",
+		"to.Status = &converted",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)
@@ -1260,6 +1445,76 @@ func Cast(src Source) error {
 		"for _, item := range from.Counts",
 		"copied = append(copied, uint8(item))",
 		"to.Counts = copied",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderDeepCopyNestedPointerSliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type ChildSource struct {
+	Image Raw
+}
+
+type ChildDestination struct {
+	Image *string
+}
+
+type Source struct {
+	Children []*ChildSource
+}
+
+type Destination struct {
+	Children []ChildDestination
+}
+
+func ConvertRaw(src Raw) (string, error) {
+	return src.Value, nil
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		DeepCopy: true,
+		Converters: copier.Converters{
+			copier.UseConverter(ConvertRaw),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	helper := nestedMapperNameForField(m.pairs[0].fields[0])
+	for _, want := range []string{
+		"copied := make([]ChildDestination, 0, len(from.Children))",
+		"for _, item := range from.Children",
+		"var convertedItem ChildDestination",
+		"if err := " + helper + "(&convertedItem, item, opt); err != nil {",
+		"copied = append(copied, convertedItem)",
+		"to.Children = copied",
+		"converter, ok := copier.FindConverter[Raw, string](opt.Converters)",
+		"to.Image = &converted",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("generated output does not contain %q:\n%s", want, text)

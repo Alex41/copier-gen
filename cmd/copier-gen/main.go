@@ -94,13 +94,18 @@ type fieldCopy struct {
 	nested           []fieldCopy
 	nestedPtr        bool
 	nestedAlloc      string
+	nestedSrcType    types.Type
+	nestedDstType    types.Type
 	ptrCopy          bool
 	sliceCopy        bool
+	sliceNested      bool
 	converter        bool
 	slice            bool
+	converterPtr     bool
 	converterFn      string
 	converterSrcType types.Type
 	converterDstType types.Type
+	converterContext bool
 	insensitive      bool
 	importTypes      []types.Type
 }
@@ -111,9 +116,10 @@ type sourceField struct {
 }
 
 type staticConverter struct {
-	srcType types.Type
-	dstType types.Type
-	fn      string
+	srcType     types.Type
+	dstType     types.Type
+	fn          string
+	withContext bool
 }
 
 const (
@@ -449,7 +455,7 @@ func staticConverterFromUseCall(fset *token.FileSet, file *ast.File, info *types
 	if len(call.Args) != 1 {
 		return staticConverter{}, false
 	}
-	src, dst, ok := useConverterTypes(file, call, info)
+	src, dst, withContext, ok := useConverterTypes(file, call, info)
 	if !ok {
 		return staticConverter{}, false
 	}
@@ -458,9 +464,10 @@ func staticConverterFromUseCall(fset *token.FileSet, file *ast.File, info *types
 		return staticConverter{}, false
 	}
 	return staticConverter{
-		srcType: src,
-		dstType: dst,
-		fn:      fn,
+		srcType:     src,
+		dstType:     dst,
+		fn:          fn,
+		withContext: withContext,
 	}, true
 }
 
@@ -481,7 +488,7 @@ func mergeConverters(base, override map[string]staticConverter) map[string]stati
 	return merged
 }
 
-func useConverterTypes(file *ast.File, call *ast.CallExpr, info *types.Info) (types.Type, types.Type, bool) {
+func useConverterTypes(file *ast.File, call *ast.CallExpr, info *types.Info) (types.Type, types.Type, bool, bool) {
 	var fun ast.Expr
 	var typeArgs []ast.Expr
 	switch indexed := call.Fun.(type) {
@@ -493,34 +500,39 @@ func useConverterTypes(file *ast.File, call *ast.CallExpr, info *types.Info) (ty
 		typeArgs = []ast.Expr{indexed.Index}
 	default:
 		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "UseConverter" {
-			return nil, nil, false
+		if !ok || !isUseConverterName(sel.Sel.Name) {
+			return nil, nil, false, false
 		}
 		if !isCopierSelectorCall(file, call, info) {
-			return nil, nil, false
+			return nil, nil, false, false
 		}
-		return converterArgTypes(info, call.Args[0])
+		src, dst, ok := converterArgTypes(info, call.Args[0], sel.Sel.Name == "UseConverterContext")
+		return src, dst, sel.Sel.Name == "UseConverterContext", ok
 	}
 	if len(typeArgs) != 2 {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	sel, ok := fun.(*ast.SelectorExpr)
-	if !ok || sel.Sel.Name != "UseConverter" {
-		return nil, nil, false
+	if !ok || !isUseConverterName(sel.Sel.Name) {
+		return nil, nil, false, false
 	}
 	callLike := &ast.CallExpr{Fun: sel}
 	if !isCopierSelectorCall(file, callLike, info) {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
 	src := typeExprType(info, typeArgs[0])
 	dst := typeExprType(info, typeArgs[1])
 	if src == nil || dst == nil {
-		return nil, nil, false
+		return nil, nil, false, false
 	}
-	return src, dst, true
+	return src, dst, sel.Sel.Name == "UseConverterContext", true
 }
 
-func converterArgTypes(info *types.Info, expr ast.Expr) (types.Type, types.Type, bool) {
+func isUseConverterName(name string) bool {
+	return name == "UseConverter" || name == "UseConverterContext"
+}
+
+func converterArgTypes(info *types.Info, expr ast.Expr, withContext bool) (types.Type, types.Type, bool) {
 	if info == nil {
 		return nil, nil, false
 	}
@@ -530,13 +542,32 @@ func converterArgTypes(info *types.Info, expr ast.Expr) (types.Type, types.Type,
 	}
 	sig, ok := t.Underlying().(*types.Signature)
 	if !ok || sig.Params().Len() != 1 || sig.Results().Len() != 2 {
+		if !withContext || !ok || sig.Params().Len() != 2 || sig.Results().Len() != 2 {
+			return nil, nil, false
+		}
+		if !isContextType(sig.Params().At(0).Type()) {
+			return nil, nil, false
+		}
+	} else if withContext {
 		return nil, nil, false
 	}
 	errType := sig.Results().At(1).Type()
 	if errType == nil || errType.String() != "error" {
 		return nil, nil, false
 	}
+	if withContext {
+		return sig.Params().At(1).Type(), sig.Results().At(0).Type(), true
+	}
 	return sig.Params().At(0).Type(), sig.Results().At(0).Type(), true
+}
+
+func isContextType(t types.Type) bool {
+	named, ok := t.(*types.Named)
+	if !ok {
+		return false
+	}
+	obj := named.Obj()
+	return obj.Name() == "Context" && obj.Pkg() != nil && obj.Pkg().Path() == "context"
 }
 
 func typeExprType(info *types.Info, expr ast.Expr) types.Type {
@@ -866,6 +897,10 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 			pair.fields = append(pair.fields, converterFieldCopy(srcField, dstField, flags, insensitive, converter))
 			continue
 		}
+		if converter, ok := pointerDestinationConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+			pair.fields = append(pair.fields, pointerConverterFieldCopy(srcField, dstField, flags, insensitive, converter))
+			continue
+		}
 
 		if pair.deepCopy && needsDeepCopy(srcField.field.Type()) {
 			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters); ok {
@@ -921,6 +956,7 @@ func applyConverter(field fieldCopy, converter staticConverter) fieldCopy {
 	field.converterFn = converter.fn
 	field.converterSrcType = converter.srcType
 	field.converterDstType = converter.dstType
+	field.converterContext = converter.withContext
 	field.importTypes = []types.Type{converter.srcType, converter.dstType}
 	return field
 }
@@ -929,6 +965,12 @@ func sliceConverterFieldCopy(srcField sourceField, dstField *types.Var, flags ui
 	field := converterFieldCopy(srcField, dstField, flags, insensitive, converter)
 	field.slice = true
 	field.importTypes = append(field.importTypes, dstField.Type())
+	return field
+}
+
+func pointerConverterFieldCopy(srcField sourceField, dstField *types.Var, flags uint8, insensitive bool, converter staticConverter) fieldCopy {
+	field := converterFieldCopy(srcField, dstField, flags, insensitive, converter)
+	field.converterPtr = true
 	return field
 }
 
@@ -1029,7 +1071,47 @@ func deepFieldCopy(
 		field.importTypes = append(field.importTypes, dstField.Type())
 		return field, true
 	}
+	if field, ok := sliceNestedFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters); ok {
+		return field, true
+	}
 	return fieldCopy{}, false
+}
+
+func sliceNestedFieldCopy(
+	srcField sourceField,
+	dstField *types.Var,
+	flags uint8,
+	insensitive bool,
+	currentPkg string,
+	converters map[string]staticConverter,
+) (fieldCopy, bool) {
+	srcSlice, ok := srcField.field.Type().Underlying().(*types.Slice)
+	if !ok {
+		return fieldCopy{}, false
+	}
+	dstSlice, ok := dstField.Type().Underlying().(*types.Slice)
+	if !ok {
+		return fieldCopy{}, false
+	}
+	srcElem := srcSlice.Elem()
+	dstElem := dstSlice.Elem()
+	nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(
+		srcElem, dstElem, "item", "convertedItem", currentPkg, converters,
+	)
+	if !ok {
+		return fieldCopy{}, false
+	}
+	field := baseFieldCopy(srcField, dstField, flags, insensitive)
+	field.sliceNested = true
+	field.nilSafe = true
+	field.zeroAssign = fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg))
+	field.nested = nested
+	field.nestedPtr = nestedPtr
+	field.nestedAlloc = nestedAlloc
+	field.nestedSrcType = srcElem
+	field.nestedDstType = dstElem
+	field.importTypes = []types.Type{dstField.Type(), dstElem}
+	return field, true
 }
 
 func pointerDeepAssignment(src, dst types.Type, srcExpr string, currentPkg string) (assignment, bool) {
@@ -1115,6 +1197,14 @@ func nestedFieldCopiesDepth(
 	if !ok {
 		return nil, false, "", false
 	}
+	srcTags, err := structTags(srcStruct)
+	if err != nil {
+		return nil, false, "", false
+	}
+	dstTags, err := structTags(dstStruct)
+	if err != nil {
+		return nil, false, "", false
+	}
 
 	var fields []fieldCopy
 	for i := 0; i < dstStruct.NumFields(); i++ {
@@ -1122,27 +1212,44 @@ func nestedFieldCopiesDepth(
 		if !dstField.Exported() {
 			continue
 		}
-		srcField, _, ok := findField(srcStruct, dstField.Name())
-		if !ok {
+		dstTag := dstTags[dstField.Name()]
+		flags := dstTag.flags
+		if flags&tagIgnore != 0 {
 			continue
 		}
-		source := srcExpr + "." + srcField.Name()
-		if converter, ok := converters[converterKey(srcField.Type(), dstField.Type())]; ok {
-			field := baseFieldCopyValues(srcField.Name(), source, srcField.Type(), dstField, 0, false)
+		srcFieldName := sourceNameFor(dstField.Name(), dstTag.name, srcTags)
+		srcField, insensitive, ok := findSourceField(srcStruct, srcFieldName, srcTags)
+		if !ok {
+			if flags&tagMust != 0 {
+				return nil, false, "", false
+			}
+			continue
+		}
+		source := srcExpr + "." + srcField.expr
+		if converter, ok := converters[converterKey(srcField.field.Type(), dstField.Type())]; ok {
+			field := baseFieldCopyValues(srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive)
 			field.dstName = dstPrefix + "." + dstField.Name()
 			fields = append(fields, applyConverter(field, converter))
 			continue
 		}
-		assign, ok := assignmentExpr(srcField.Type(), dstField.Type(), source, currentPkg)
+		if converter, ok := pointerDestinationConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+			field := baseFieldCopyValues(srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive)
+			field.dstName = dstPrefix + "." + dstField.Name()
+			field = applyConverter(field, converter)
+			field.converterPtr = true
+			fields = append(fields, field)
+			continue
+		}
+		assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), source, currentPkg)
 		if !ok {
 			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(
-				srcField.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, depth+1,
+				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, depth+1,
 			)
 			if !nestedOK {
 				return nil, false, "", false
 			}
 			field := baseFieldCopyValues(
-				srcField.Name(), source, srcField.Type(), dstField, 0, false,
+				srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive,
 			)
 			field.dstName = dstPrefix + "." + dstField.Name()
 			field.nilSafe = true
@@ -1154,8 +1261,10 @@ func nestedFieldCopiesDepth(
 			fields = append(fields, field)
 			continue
 		}
-		field := assignmentFieldCopyValues(srcField.Name(), source, srcField.Type(), dstField, assign)
+		field := assignmentFieldCopyValues(srcField.field.Name(), source, srcField.field.Type(), dstField, assign)
 		field.dstName = dstPrefix + "." + dstField.Name()
+		field.flags = flags
+		field.insensitive = insensitive
 		fields = append(fields, field)
 	}
 	alloc := ""
@@ -1175,6 +1284,15 @@ func sliceElementConverter(src, dst types.Type, converters map[string]staticConv
 		return staticConverter{}, false
 	}
 	converter, ok := converters[converterKey(srcSlice.Elem(), dstSlice.Elem())]
+	return converter, ok
+}
+
+func pointerDestinationConverter(src, dst types.Type, converters map[string]staticConverter) (staticConverter, bool) {
+	dstPtr, ok := dst.(*types.Pointer)
+	if !ok {
+		return staticConverter{}, false
+	}
+	converter, ok := converters[converterKey(src, dstPtr.Elem())]
 	return converter, ok
 }
 
@@ -1590,13 +1708,14 @@ func collectNestedMappers(m model) []nestedMapper {
 		if len(field.nested) == 0 {
 			return
 		}
-		fields := normalizeNestedFields(field.nested, field.srcExpr, field.dstName)
-		key := nestedMapperKey(field.srcType, field.dstType, fields)
+		fields := normalizeNestedFieldsForField(field)
+		srcType, dstType := nestedMapperTypesForField(field)
+		key := nestedMapperKey(srcType, dstType, fields)
 		if _, ok := byKey[key]; !ok {
 			byKey[key] = nestedMapper{
-				name:    nestedMapperName(field.srcType, field.dstType, fields),
-				srcType: field.srcType,
-				dstType: field.dstType,
+				name:    nestedMapperName(srcType, dstType, fields),
+				srcType: srcType,
+				dstType: dstType,
 				fields:  fields,
 			}
 		}
@@ -1738,24 +1857,74 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 	}
 	if field.converter {
 		fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
-		fmt.Fprintf(b, "converter, ok := copier.FindConverter[%s, %s](opt.Converters)\n",
-			typeString(field.converterSrcType, currentPkg), typeString(field.converterDstType, currentPkg))
+		if field.converterContext {
+			fmt.Fprintf(b, "converter, ok := copier.FindConverterContext[%s, %s](opt.Converters)\n",
+				typeString(field.converterSrcType, currentPkg), typeString(field.converterDstType, currentPkg))
+		} else {
+			fmt.Fprintf(b, "converter, ok := copier.FindConverter[%s, %s](opt.Converters)\n",
+				typeString(field.converterSrcType, currentPkg), typeString(field.converterDstType, currentPkg))
+		}
 		fmt.Fprintln(b, "if !ok { return copier.ErrGeneratedConverterNotFound }")
 		if field.slice {
 			fmt.Fprintf(b, "var converted %s\n", typeString(field.dstType, currentPkg))
 			fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 			fmt.Fprintf(b, "converted = make(%s, 0, len(%s))\n", typeString(field.dstType, currentPkg), field.srcExpr)
 			fmt.Fprintf(b, "for _, item := range %s {\n", field.srcExpr)
-			fmt.Fprintln(b, "convertedItem, err := converter(item)")
+			if field.converterContext {
+				fmt.Fprintln(b, "convertedItem, err := converter(opt.Context, item)")
+			} else {
+				fmt.Fprintln(b, "convertedItem, err := converter(item)")
+			}
 			fmt.Fprintln(b, "if err != nil { return err }")
 			fmt.Fprintln(b, "converted = append(converted, convertedItem)")
 			fmt.Fprintln(b, "}")
 			fmt.Fprintln(b, "}")
 		} else {
-			fmt.Fprintf(b, "converted, err := converter(%s)\n", field.srcExpr)
+			if field.converterContext {
+				fmt.Fprintf(b, "converted, err := converter(opt.Context, %s)\n", field.srcExpr)
+			} else {
+				fmt.Fprintf(b, "converted, err := converter(%s)\n", field.srcExpr)
+			}
 			fmt.Fprintln(b, "if err != nil { return err }")
 		}
-		fmt.Fprintf(b, "to.%s = converted\n", field.dstName)
+		if field.converterPtr {
+			fmt.Fprintf(b, "to.%s = &converted\n", field.dstName)
+		} else {
+			fmt.Fprintf(b, "to.%s = converted\n", field.dstName)
+		}
+		fmt.Fprintln(b, "}")
+	} else if field.ptrCopy {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		fmt.Fprintf(b, "copied := %s\n", field.assignExpr)
+		fmt.Fprintf(b, "to.%s = &copied\n", field.dstName)
+		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		fmt.Fprintln(b, "}")
+	} else if field.sliceNested {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		fmt.Fprintf(b, "copied := make(%s, 0, len(%s))\n", typeString(field.dstType, currentPkg), field.srcExpr)
+		fmt.Fprintf(b, "for _, item := range %s {\n", field.srcExpr)
+		fmt.Fprintln(b, "if item == nil {")
+		if field.nestedPtr {
+			fmt.Fprintln(b, "copied = append(copied, nil)")
+		} else {
+			fmt.Fprintf(b, "copied = append(copied, copiergen.Zero[%s]())\n", typeString(field.nestedDstType, currentPkg))
+		}
+		fmt.Fprintln(b, "continue")
+		fmt.Fprintln(b, "}")
+		toExpr := "&convertedItem"
+		if field.nestedPtr {
+			fmt.Fprintf(b, "convertedItem := new(%s)\n", field.nestedAlloc)
+			toExpr = "convertedItem"
+		} else {
+			fmt.Fprintf(b, "var convertedItem %s\n", typeString(field.nestedDstType, currentPkg))
+		}
+		fmt.Fprintf(b, "if err := %s(%s, item, opt); err != nil { return err }\n", nestedMapperNameForField(field), toExpr)
+		fmt.Fprintln(b, "copied = append(copied, convertedItem)")
+		fmt.Fprintln(b, "}")
+		fmt.Fprintf(b, "to.%s = copied\n", field.dstName)
+		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
 		fmt.Fprintln(b, "}")
 	} else if len(field.nested) > 0 {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
@@ -1769,13 +1938,6 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 			toExpr,
 			field.srcExpr,
 		)
-		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
-		fmt.Fprintln(b, "}")
-	} else if field.ptrCopy {
-		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
-		fmt.Fprintf(b, "copied := %s\n", field.assignExpr)
-		fmt.Fprintf(b, "to.%s = &copied\n", field.dstName)
 		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
 		fmt.Fprintln(b, "}")
@@ -1855,7 +2017,7 @@ func writeFieldPlan(plan *strings.Builder, fields []fieldCopy) {
 	for _, field := range fields {
 		fmt.Fprintf(
 			plan,
-			"%s|%s|%s|%s|%d|%t|%t|%t|%t|%t|%s|%s|",
+			"%s|%s|%s|%s|%d|%t|%t|%t|%t|%t|%t|%t|%t|%s|%s|%s|%s|",
 			field.srcExpr,
 			field.dstName,
 			typeKey(field.srcType),
@@ -1864,10 +2026,15 @@ func writeFieldPlan(plan *strings.Builder, fields []fieldCopy) {
 			field.nilSafe,
 			field.ptrCopy,
 			field.sliceCopy,
+			field.sliceNested,
 			field.converter,
 			field.slice,
+			field.converterPtr,
+			field.converterContext,
 			field.assignExpr,
 			field.zeroAssign,
+			typeKeyOrUnknown(field.nestedSrcType),
+			typeKeyOrUnknown(field.nestedDstType),
 		)
 		if field.converter {
 			fmt.Fprintf(plan, "%s|%s|", typeKey(field.converterSrcType), typeKey(field.converterDstType))
@@ -1884,8 +2051,23 @@ func nestedMapperName(src, dst types.Type, fields []fieldCopy) string {
 }
 
 func nestedMapperNameForField(field fieldCopy) string {
-	fields := normalizeNestedFields(field.nested, field.srcExpr, field.dstName)
-	return nestedMapperName(field.srcType, field.dstType, fields)
+	fields := normalizeNestedFieldsForField(field)
+	srcType, dstType := nestedMapperTypesForField(field)
+	return nestedMapperName(srcType, dstType, fields)
+}
+
+func normalizeNestedFieldsForField(field fieldCopy) []fieldCopy {
+	if field.sliceNested {
+		return normalizeNestedFields(field.nested, "item", "convertedItem")
+	}
+	return normalizeNestedFields(field.nested, field.srcExpr, field.dstName)
+}
+
+func nestedMapperTypesForField(field fieldCopy) (types.Type, types.Type) {
+	if field.sliceNested {
+		return field.nestedSrcType, field.nestedDstType
+	}
+	return field.srcType, field.dstType
 }
 
 var nonIdentifier = regexp.MustCompile(`[^a-zA-Z0-9_]`)

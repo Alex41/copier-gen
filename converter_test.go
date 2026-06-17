@@ -1,6 +1,9 @@
 package copier
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestGenericConverter(t *testing.T) {
 	converter := Converter[int, string](func(src int) (string, error) {
@@ -27,6 +30,36 @@ func TestUseConverter(t *testing.T) {
 	}
 	if got != "ok" {
 		t.Fatalf("converter returned %q", got)
+	}
+}
+
+func TestUseConverterContext(t *testing.T) {
+	type key struct{}
+	ctx := context.WithValue(context.Background(), key{}, "ctx")
+	converter := UseConverterContext[int, string](func(ctx context.Context, src int) (string, error) {
+		return ctx.Value(key{}).(string), nil
+	})
+
+	got, err := converter(ctx, 1)
+	if err != nil {
+		t.Fatalf("converter returned error: %v", err)
+	}
+	if got != "ctx" {
+		t.Fatalf("converter returned %q", got)
+	}
+	found, ok := FindConverterContext[int, string](Converters{converter})
+	if !ok {
+		t.Fatal("FindConverterContext did not find context converter")
+	}
+	got, err = found(ctx, 1)
+	if err != nil {
+		t.Fatalf("found converter returned error: %v", err)
+	}
+	if got != "ctx" {
+		t.Fatalf("found converter returned %q", got)
+	}
+	if _, ok := FindConverter[int, string](Converters{converter}); ok {
+		t.Fatal("FindConverter found context converter as ordinary converter")
 	}
 }
 
