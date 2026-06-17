@@ -1085,7 +1085,22 @@ func sliceNestedFieldCopy(
 	currentPkg string,
 	converters map[string]staticConverter,
 ) (fieldCopy, bool) {
-	srcSlice, ok := srcField.field.Type().Underlying().(*types.Slice)
+	return sliceNestedFieldCopyValues(
+		srcField.field.Name(), "from."+srcField.expr, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters,
+	)
+}
+
+func sliceNestedFieldCopyValues(
+	srcName string,
+	srcExpr string,
+	srcType types.Type,
+	dstField *types.Var,
+	flags uint8,
+	insensitive bool,
+	currentPkg string,
+	converters map[string]staticConverter,
+) (fieldCopy, bool) {
+	srcSlice, ok := srcType.Underlying().(*types.Slice)
 	if !ok {
 		return fieldCopy{}, false
 	}
@@ -1101,7 +1116,7 @@ func sliceNestedFieldCopy(
 	if !ok {
 		return fieldCopy{}, false
 	}
-	field := baseFieldCopy(srcField, dstField, flags, insensitive)
+	field := baseFieldCopyValues(srcName, srcExpr, srcType, dstField, flags, insensitive)
 	field.sliceNested = true
 	field.nilSafe = true
 	field.zeroAssign = fmt.Sprintf("copiergen.Zero[%s]()", typeString(dstField.Type(), currentPkg))
@@ -1246,6 +1261,13 @@ func nestedFieldCopiesDepth(
 				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, depth+1,
 			)
 			if !nestedOK {
+				if field, ok := sliceNestedFieldCopyValues(
+					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters,
+				); ok {
+					field.dstName = dstPrefix + "." + dstField.Name()
+					fields = append(fields, field)
+					continue
+				}
 				return nil, false, "", false
 			}
 			field := baseFieldCopyValues(
