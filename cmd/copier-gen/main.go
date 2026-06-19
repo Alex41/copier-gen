@@ -172,6 +172,10 @@ func loadModel(dir string, rawPairs []string) (model, error) {
 }
 
 func loadModelPackages(dir string, rawPairs []string) (model, error) {
+	overlay, err := generatedFileOverlay(dir)
+	if err != nil {
+		return model{}, err
+	}
 	cfg := &packages.Config{
 		Mode: packages.NeedName |
 			packages.NeedFiles |
@@ -179,8 +183,9 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 			packages.NeedTypes |
 			packages.NeedTypesInfo |
 			packages.NeedImports,
-		Dir:   dir,
-		Tests: false,
+		Dir:     dir,
+		Tests:   false,
+		Overlay: overlay,
 	}
 	pkgs, err := packages.Load(cfg, ".")
 	if err != nil {
@@ -208,7 +213,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 		seen[key] = true
 		built, err := buildPairFromTypes(pair, pkg.PkgPath, mergeConverters(m.converters, pair.converters))
 		if err != nil {
-			return model{}, generationError{err: err}
+			return model{}, generationError{err: pairBuildError(pair, err)}
 		}
 		m.pairs = append(m.pairs, built)
 	}
@@ -227,6 +232,50 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 	return m, nil
 }
 
+func generatedFileOverlay(dir string) (map[string][]byte, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	pkgName := ""
+	var generated []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		if isGeneratedGoFile(name) {
+			generated = append(generated, path)
+			continue
+		}
+		if pkgName != "" {
+			continue
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.PackageClauseOnly)
+		if err != nil {
+			return nil, err
+		}
+		pkgName = file.Name.Name
+	}
+	if pkgName == "" || len(generated) == 0 {
+		return nil, nil
+	}
+	overlay := make(map[string][]byte, len(generated))
+	for _, path := range generated {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil, err
+		}
+		overlay[abs] = []byte("package " + pkgName + "\n")
+	}
+	return overlay, nil
+}
+
+func isGeneratedGoFile(name string) bool {
+	return strings.HasSuffix(name, "_gen.go")
+}
+
 func loadModelStd(dir string, rawPairs []string) (model, error) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(dir)
@@ -237,7 +286,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 	var files []*ast.File
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || strings.HasSuffix(name, "_gen.go") {
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") || isGeneratedGoFile(name) {
 			continue
 		}
 		file, err := parser.ParseFile(fset, filepath.Join(dir, name), nil, parser.ParseComments)
@@ -279,7 +328,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 		seen[key] = true
 		built, err := buildPairFromTypes(pair, pkg.Path(), mergeConverters(m.converters, pair.converters))
 		if err != nil {
-			return model{}, err
+			return model{}, pairBuildError(pair, err)
 		}
 		m.pairs = append(m.pairs, built)
 	}
@@ -313,8 +362,9 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 				return true
 			}
 			pos := fset.Position(call.Lparen)
+			discoveredAt := positionString(pos)
 			sourceFile := filepath.Base(pos.Filename)
-			location := fmt.Sprintf("%s:%d", filepath.Base(pos.Filename), pos.Line)
+			location := discoveredAt
 			dstType := copyExpressionType(info, file, pkg, explicitTypes, call.Args[0])
 			srcType := copyExpressionType(info, file, pkg, explicitTypes, call.Args[1])
 			dstNamed, toIndirect, ok := namedStructDestination(dstType)
@@ -343,13 +393,33 @@ func discoverCopyPairs(fset *token.FileSet, files []*ast.File, info *types.Info,
 				deepCopy:     option.deepCopy,
 				converters:   option.converters,
 				sourceFile:   sourceFile,
-				discoveredAt: fmt.Sprintf("%s:%d", filepath.Base(pos.Filename), pos.Line),
+				discoveredAt: discoveredAt,
 			})
 			_ = pkg
 			return true
 		})
 	}
 	return pairs, issues
+}
+
+func positionString(pos token.Position) string {
+	filename := pos.Filename
+	if filename != "" && !filepath.IsAbs(filename) {
+		if abs, err := filepath.Abs(filename); err == nil {
+			filename = abs
+		}
+	}
+	if filename == "" {
+		filename = "-"
+	}
+	return fmt.Sprintf("%s:%d", filename, pos.Line)
+}
+
+func pairBuildError(pair copyPair, err error) error {
+	if pair.discoveredAt == "" {
+		return err
+	}
+	return fmt.Errorf("%s: %w", pair.discoveredAt, err)
 }
 
 func copyDiscoveryError(issues []string) error {

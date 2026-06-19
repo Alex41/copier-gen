@@ -158,6 +158,51 @@ func Cast(src User) (Employee, error) {
 	if !strings.Contains(err.Error(), "Required") {
 		t.Fatalf("error does not name the missing field: %v", err)
 	}
+	if !strings.Contains(err.Error(), filepath.Join(dir, "sample.go")+":16") {
+		t.Fatalf("error does not include copier call location: %v", err)
+	}
+}
+
+func TestLoadModelIgnoresStaleGeneratedFiles(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string
+}
+
+func Cast(src Source) (Destination, error) {
+	var dst Destination
+	err := copier.Copy(&dst, src, copier.Option{})
+	return dst, err
+}
+`
+	staleGenerated := `package sample
+
+func stale(from *Source) {
+	_ = from.Image
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "sample_copier_gen.go"), []byte(staleGenerated), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error for stale generated file: %v", err)
+	}
+	if len(m.pairs) != 1 {
+		t.Fatalf("expected one discovered pair, got %d", len(m.pairs))
+	}
 }
 
 func TestLoadModelDetectsCopierAlias(t *testing.T) {
