@@ -102,6 +102,8 @@ type fieldCopy struct {
 	converter        bool
 	slice            bool
 	converterPtr     bool
+	converterArgPtr  bool
+	converterItemPtr bool
 	converterFn      string
 	converterSrcType types.Type
 	converterDstType types.Type
@@ -977,8 +979,8 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				pair.fields = append(pair.fields, field)
 				continue
 			}
-			if converter, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
-				pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter))
+			if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+				pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter, argPtr, itemPtr))
 				continue
 			}
 			if assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), "from."+srcField.expr, currentPkg); ok && assign.nilSafe {
@@ -995,8 +997,8 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg, converters,
 			)
 			if !nestedOK {
-				if converter, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
-					pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter))
+				if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+					pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter, argPtr, itemPtr))
 					continue
 				}
 				{
@@ -1031,9 +1033,31 @@ func applyConverter(field fieldCopy, converter staticConverter) fieldCopy {
 	return field
 }
 
-func sliceConverterFieldCopy(srcField sourceField, dstField *types.Var, flags uint8, insensitive bool, converter staticConverter) fieldCopy {
+func sliceConverterFieldCopy(srcField sourceField, dstField *types.Var, flags uint8, insensitive bool, converter staticConverter, argPtr, itemPtr bool) fieldCopy {
 	field := converterFieldCopy(srcField, dstField, flags, insensitive, converter)
 	field.slice = true
+	field.converterArgPtr = argPtr
+	field.converterItemPtr = itemPtr
+	field.importTypes = append(field.importTypes, dstField.Type())
+	return field
+}
+
+func sliceConverterFieldCopyValues(
+	srcName string,
+	srcExpr string,
+	srcType types.Type,
+	dstField *types.Var,
+	flags uint8,
+	insensitive bool,
+	converter staticConverter,
+	argPtr bool,
+	itemPtr bool,
+) fieldCopy {
+	field := baseFieldCopyValues(srcName, srcExpr, srcType, dstField, flags, insensitive)
+	field = applyConverter(field, converter)
+	field.slice = true
+	field.converterArgPtr = argPtr
+	field.converterItemPtr = itemPtr
 	field.importTypes = append(field.importTypes, dstField.Type())
 	return field
 }
@@ -1338,6 +1362,14 @@ func nestedFieldCopiesDepth(
 					fields = append(fields, field)
 					continue
 				}
+				if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+					field := sliceConverterFieldCopyValues(
+						srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, converter, argPtr, itemPtr,
+					)
+					field.dstName = dstPrefix + "." + dstField.Name()
+					fields = append(fields, field)
+					continue
+				}
 				return nil, false, "", false
 			}
 			field := baseFieldCopyValues(
@@ -1366,17 +1398,32 @@ func nestedFieldCopiesDepth(
 	return fields, dstPtr, alloc, len(fields) > 0
 }
 
-func sliceElementConverter(src, dst types.Type, converters map[string]staticConverter) (staticConverter, bool) {
+func sliceElementConverter(src, dst types.Type, converters map[string]staticConverter) (staticConverter, bool, bool, bool) {
 	srcSlice, ok := src.Underlying().(*types.Slice)
 	if !ok {
-		return staticConverter{}, false
+		return staticConverter{}, false, false, false
 	}
 	dstSlice, ok := dst.Underlying().(*types.Slice)
 	if !ok {
-		return staticConverter{}, false
+		return staticConverter{}, false, false, false
 	}
-	converter, ok := converters[converterKey(srcSlice.Elem(), dstSlice.Elem())]
-	return converter, ok
+	srcElem := srcSlice.Elem()
+	dstElem := dstSlice.Elem()
+	if converter, ok := converters[converterKey(srcElem, dstElem)]; ok {
+		return converter, false, false, true
+	}
+	srcElemPtr := types.NewPointer(srcElem)
+	if converter, ok := converters[converterKey(srcElemPtr, dstElem)]; ok {
+		return converter, true, false, true
+	}
+	dstElemPtr := types.NewPointer(dstElem)
+	if converter, ok := converters[converterKey(srcElemPtr, dstElemPtr)]; ok {
+		return converter, true, true, true
+	}
+	if converter, ok := converters[converterKey(srcElem, dstElemPtr)]; ok {
+		return converter, false, true, true
+	}
+	return staticConverter{}, false, false, false
 }
 
 func pointerDestinationConverter(src, dst types.Type, converters map[string]staticConverter) (staticConverter, bool) {
@@ -1962,13 +2009,25 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 			fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 			fmt.Fprintf(b, "converted = make(%s, 0, len(%s))\n", typeString(field.dstType, currentPkg), field.srcExpr)
 			fmt.Fprintf(b, "for _, item := range %s {\n", field.srcExpr)
+			argExpr := "item"
+			if field.converterArgPtr {
+				argExpr = "&item"
+			}
 			if field.converterContext {
-				fmt.Fprintln(b, "convertedItem, err := converter(opt.Context, item)")
+				fmt.Fprintf(b, "convertedItem, err := converter(opt.Context, %s)\n", argExpr)
 			} else {
-				fmt.Fprintln(b, "convertedItem, err := converter(item)")
+				fmt.Fprintf(b, "convertedItem, err := converter(%s)\n", argExpr)
 			}
 			fmt.Fprintln(b, "if err != nil { return err }")
-			fmt.Fprintln(b, "converted = append(converted, convertedItem)")
+			if field.converterItemPtr {
+				fmt.Fprintln(b, "if convertedItem == nil {")
+				fmt.Fprintf(b, "converted = append(converted, copiergen.Zero[%s]())\n", typeString(field.converterDstType.(*types.Pointer).Elem(), currentPkg))
+				fmt.Fprintln(b, "} else {")
+				fmt.Fprintln(b, "converted = append(converted, *convertedItem)")
+				fmt.Fprintln(b, "}")
+			} else {
+				fmt.Fprintln(b, "converted = append(converted, convertedItem)")
+			}
 			fmt.Fprintln(b, "}")
 			fmt.Fprintln(b, "}")
 		} else {
@@ -2109,7 +2168,7 @@ func writeFieldPlan(plan *strings.Builder, fields []fieldCopy) {
 	for _, field := range fields {
 		fmt.Fprintf(
 			plan,
-			"%s|%s|%s|%s|%d|%t|%t|%t|%t|%t|%t|%t|%t|%s|%s|%s|%s|",
+			"%s|%s|%s|%s|%d|%t|%t|%t|%t|%t|%t|%t|%t|%t|%t|%s|%s|%s|%s|",
 			field.srcExpr,
 			field.dstName,
 			typeKey(field.srcType),
@@ -2122,6 +2181,8 @@ func writeFieldPlan(plan *strings.Builder, fields []fieldCopy) {
 			field.converter,
 			field.slice,
 			field.converterPtr,
+			field.converterArgPtr,
+			field.converterItemPtr,
 			field.converterContext,
 			field.assignExpr,
 			field.zeroAssign,

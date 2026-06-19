@@ -1658,6 +1658,180 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderUsesPointerElementConverterFallbacksForSliceField(t *testing.T) {
+	tests := []struct {
+		name      string
+		converter string
+		want      []string
+	}{
+		{
+			name: "exact converter wins",
+			converter: `copier.UseConverter(func(s string) (Formatted, error) {
+				return Formatted{Label: s}, nil
+			}),
+			copier.UseConverter(func(s *string) (Formatted, error) {
+				return Formatted{Label: *s}, nil
+			}),`,
+			want: []string{
+				"converter, ok := copier.FindConverter[string, Formatted](opt.Converters)",
+				"convertedItem, err := converter(item)",
+				"converted = append(converted, convertedItem)",
+			},
+		},
+		{
+			name: "pointer source",
+			converter: `copier.UseConverter(func(s *string) (Formatted, error) {
+				return Formatted{Label: *s}, nil
+			}),`,
+			want: []string{
+				"converter, ok := copier.FindConverter[*string, Formatted](opt.Converters)",
+				"convertedItem, err := converter(&item)",
+				"converted = append(converted, convertedItem)",
+			},
+		},
+		{
+			name: "pointer source and destination",
+			converter: `copier.UseConverter(func(s *string) (*Formatted, error) {
+				return &Formatted{Label: *s}, nil
+			}),`,
+			want: []string{
+				"converter, ok := copier.FindConverter[*string, *Formatted](opt.Converters)",
+				"convertedItem, err := converter(&item)",
+				"if convertedItem == nil {",
+				"converted = append(converted, copiergen.Zero[Formatted]())",
+				"converted = append(converted, *convertedItem)",
+			},
+		},
+		{
+			name: "pointer destination",
+			converter: `copier.UseConverter(func(s string) (*Formatted, error) {
+				return &Formatted{Label: s}, nil
+			}),`,
+			want: []string{
+				"converter, ok := copier.FindConverter[string, *Formatted](opt.Converters)",
+				"convertedItem, err := converter(item)",
+				"if convertedItem == nil {",
+				"converted = append(converted, copiergen.Zero[Formatted]())",
+				"converted = append(converted, *convertedItem)",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			src := strings.ReplaceAll(`package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Points []string
+}
+
+type Destination struct {
+	Points []Formatted
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Converters: copier.Converters{
+			__CONVERTER__
+		},
+	})
+}
+`, "__CONVERTER__", tt.converter)
+			if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			m, err := loadModel(dir, nil)
+			if err != nil {
+				t.Fatalf("loadModel returned error: %v", err)
+			}
+			out, err := render(m)
+			if err != nil {
+				t.Fatalf("render returned error: %v", err)
+			}
+			text := string(out)
+			for _, want := range tt.want {
+				if !strings.Contains(text, want) {
+					t.Fatalf("generated output does not contain %q:\n%s", want, text)
+				}
+			}
+		})
+	}
+}
+
+func TestRenderUsesPointerElementConverterInsideNestedSlice(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type FileInfo struct {
+	Path string
+}
+
+type Question struct {
+	Files []string
+}
+
+type Survey struct {
+	Questions []*Question
+}
+
+type QuestionResponse struct {
+	Files []FileInfo
+}
+
+type SurveyResponse struct {
+	Questions []QuestionResponse
+}
+
+func Cast(src *Survey) error {
+	dst := &SurveyResponse{}
+	return copier.Copy(dst, src, copier.Option{
+		DeepCopy: true,
+		Converters: copier.Converters{
+			copier.UseConverter(func(s *string) (FileInfo, error) {
+				return FileInfo{Path: *s}, nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverter[*string, FileInfo](opt.Converters)",
+		"for _, item := range from.Questions",
+		"for _, item := range from.Files",
+		"convertedItem, err := converter(&item)",
+		"converted = append(converted, convertedItem)",
+		"to.Files = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestLoadModelFailsWhenRequiredConverterIsMissing(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
