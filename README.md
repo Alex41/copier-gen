@@ -130,6 +130,8 @@ Converter rules:
 - context-aware converters receive `Option.Context`; `Copy` uses
   `context.Background()` when no context is provided
 - element converters can generate slice mappings such as `[]Src -> []Dst`
+- slice element converter resolution prefers `Src -> Dst`, then falls back to
+  `*Src -> Dst`, `*Src -> *Dst`, and `Src -> *Dst`
 - generated code performs a typed lookup in the current call's
   `opt.Converters`; it does not use reflection
 - if a required converter cannot be resolved during generation, generation
@@ -171,7 +173,8 @@ Supported deep-copy cases include:
 - pointer-to-struct nested mapping
 - recursive nested struct mapping
 - slices with assignable or convertible element types
-- slices using a registered element converter
+- slices using a registered element converter, including pointer/value element
+  converter fallbacks
 - numeric conversions supported by Go, including fields inside nested generic
   structs such as `Range[uint] -> Range[uint8]`
 
