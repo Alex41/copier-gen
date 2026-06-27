@@ -1497,6 +1497,93 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderInitSliceForAssignableSliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Points []string
+}
+
+type Destination struct {
+	Points []string ` + "`copier:\"init_slice\"`" + `
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{IgnoreEmpty: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Points != nil {",
+		"to.Points = from.Points",
+		"} else {",
+		"to.Points = make([]string, 0)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestRenderInitSliceForDeepCopiedSliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Points []string
+}
+
+type Destination struct {
+	Points []string ` + "`copier:\"init_slice\"`" + `
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true, IgnoreEmpty: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"copied := make([]string, 0, len(from.Points))",
+		"} else {",
+		"to.Points = make([]string, 0)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
 func TestRenderDeepCopyNestedPointerSliceField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
@@ -1596,6 +1683,38 @@ func Cast(src Source) error {
 	}
 	if !strings.Contains(err.Error(), "cannot generate deep copy mapper") {
 		t.Fatalf("error does not explain unsupported deep copy: %v", err)
+	}
+}
+
+func TestLoadModelFailsWhenInitSliceTagsNonSliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string ` + "`copier:\"init_slice\"`" + `
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := loadModel(dir, nil)
+	if err == nil {
+		t.Fatal("loadModel succeeded for init_slice on a non-slice field")
+	}
+	if !strings.Contains(err.Error(), "uses init_slice but is not a slice") {
+		t.Fatalf("error does not explain invalid init_slice tag: %v", err)
 	}
 }
 
@@ -1764,6 +1883,66 @@ func Cast(src Source) error {
 				}
 			}
 		})
+	}
+}
+
+func TestRenderInitSliceForConverterSliceField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Raw struct {
+	Value string
+}
+
+type Formatted struct {
+	Label string
+}
+
+type Source struct {
+	Points []Raw
+}
+
+type Destination struct {
+	Points []Formatted ` + "`copier:\"init_slice\"`" + `
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		IgnoreEmpty: true,
+		Converters: copier.Converters{
+			copier.UseConverter(func(s Raw) (Formatted, error) {
+				return Formatted{Label: s.Value}, nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"var converted []Formatted",
+		"converted = make([]Formatted, 0)",
+		"if from.Points != nil {",
+		"converted = make([]Formatted, 0, len(from.Points))",
+		"to.Points = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
 	}
 }
 

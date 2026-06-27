@@ -128,6 +128,7 @@ const (
 	tagIgnore uint8 = 1 << iota
 	tagOverride
 	tagMust
+	tagInitSlice
 )
 
 func main() {
@@ -954,6 +955,10 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 		if flags&tagIgnore != 0 {
 			continue
 		}
+		if flags&tagInitSlice != 0 && !isSliceType(dstField.Type()) {
+			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: destination field %s uses init_slice but is not a slice",
+				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name())
+		}
 
 		srcFieldName := sourceNameFor(dstField.Name(), dstTag.name, srcTags)
 		srcField, insensitive, ok := findSourceField(pair.src, srcFieldName, srcTags)
@@ -1326,6 +1331,9 @@ func nestedFieldCopiesDepth(
 		if flags&tagIgnore != 0 {
 			continue
 		}
+		if flags&tagInitSlice != 0 && !isSliceType(dstField.Type()) {
+			return nil, false, "", false
+		}
 		srcFieldName := sourceNameFor(dstField.Name(), dstTag.name, srcTags)
 		srcField, insensitive, ok := findSourceField(srcStruct, srcFieldName, srcTags)
 		if !ok {
@@ -1498,6 +1506,8 @@ func parseTag(tag string) (tagInfo, error) {
 			info.flags |= tagMust
 		case "override":
 			info.flags |= tagOverride
+		case "init_slice":
+			info.flags |= tagInitSlice
 		default:
 			r := []rune(part)
 			if len(r) == 0 || !unicode.IsUpper(r[0]) {
@@ -1507,6 +1517,11 @@ func parseTag(tag string) (tagInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+func isSliceType(t types.Type) bool {
+	_, ok := t.Underlying().(*types.Slice)
+	return ok
 }
 
 func sourceNameFor(dstFieldName, dstTagName string, srcTags map[string]tagInfo) string {
@@ -1995,7 +2010,7 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintln(b, "if !opt.CaseSensitive {")
 	}
 	if field.converter {
-		fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
+		renderCopyBlockStart(b, field)
 		if field.converterContext {
 			fmt.Fprintf(b, "converter, ok := copier.FindConverterContext[%s, %s](opt.Converters)\n",
 				typeString(field.converterSrcType, currentPkg), typeString(field.converterDstType, currentPkg))
@@ -2006,6 +2021,9 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintln(b, "if !ok { return copier.ErrGeneratedConverterNotFound }")
 		if field.slice {
 			fmt.Fprintf(b, "var converted %s\n", typeString(field.dstType, currentPkg))
+			if fieldInitSlice(field) {
+				fmt.Fprintf(b, "converted = %s\n", initSliceExpr(field.dstType, currentPkg))
+			}
 			fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 			fmt.Fprintf(b, "converted = make(%s, 0, len(%s))\n", typeString(field.dstType, currentPkg), field.srcExpr)
 			fmt.Fprintf(b, "for _, item := range %s {\n", field.srcExpr)
@@ -2048,8 +2066,8 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 		fmt.Fprintf(b, "copied := %s\n", field.assignExpr)
 		fmt.Fprintf(b, "to.%s = &copied\n", field.dstName)
-		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		renderNilSourceElse(b, field)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, zeroAssignExpr(field, currentPkg))
 		fmt.Fprintln(b, "}")
 	} else if field.sliceNested {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
@@ -2074,8 +2092,8 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintln(b, "copied = append(copied, convertedItem)")
 		fmt.Fprintln(b, "}")
 		fmt.Fprintf(b, "to.%s = copied\n", field.dstName)
-		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		renderNilSourceElse(b, field)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, zeroAssignExpr(field, currentPkg))
 		fmt.Fprintln(b, "}")
 	} else if len(field.nested) > 0 {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
@@ -2089,8 +2107,8 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 			toExpr,
 			field.srcExpr,
 		)
-		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		renderNilSourceElse(b, field)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, zeroAssignExpr(field, currentPkg))
 		fmt.Fprintln(b, "}")
 	} else if field.sliceCopy {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
@@ -2099,14 +2117,20 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintf(b, "copied = append(copied, %s)\n", field.assignExpr)
 		fmt.Fprintln(b, "}")
 		fmt.Fprintf(b, "to.%s = copied\n", field.dstName)
-		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		renderNilSourceElse(b, field)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, zeroAssignExpr(field, currentPkg))
 		fmt.Fprintln(b, "}")
 	} else if field.nilSafe {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
-		fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
-		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.zeroAssign)
+		renderNilSourceElse(b, field)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, zeroAssignExpr(field, currentPkg))
+		fmt.Fprintln(b, "}")
+	} else if fieldInitSlice(field) {
+		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
+		fmt.Fprintln(b, "} else {")
+		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, initSliceExpr(field.dstType, currentPkg))
 		fmt.Fprintln(b, "}")
 	} else {
 		fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
@@ -2116,6 +2140,37 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 	if field.insensitive {
 		fmt.Fprintln(b, "}")
 	}
+}
+
+func renderCopyBlockStart(b *bytes.Buffer, field fieldCopy) {
+	if fieldInitSlice(field) {
+		fmt.Fprintln(b, "{")
+		return
+	}
+	fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
+}
+
+func renderNilSourceElse(b *bytes.Buffer, field fieldCopy) {
+	if fieldInitSlice(field) {
+		fmt.Fprintln(b, "} else {")
+		return
+	}
+	fmt.Fprintf(b, "} else if !copiergen.ShouldIgnoreEmpty(true, %d, opt) {\n", field.flags)
+}
+
+func zeroAssignExpr(field fieldCopy, currentPkg string) string {
+	if fieldInitSlice(field) {
+		return initSliceExpr(field.dstType, currentPkg)
+	}
+	return field.zeroAssign
+}
+
+func initSliceExpr(t types.Type, currentPkg string) string {
+	return fmt.Sprintf("make(%s, 0)", typeString(t, currentPkg))
+}
+
+func fieldInitSlice(field fieldCopy) bool {
+	return field.flags&tagInitSlice != 0
 }
 
 func typeString(t types.Type, currentPkg string) string {

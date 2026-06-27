@@ -148,6 +148,7 @@ Generated code supports the copier tags:
 | `copier:"-"` | Ignore destination field. |
 | `copier:"must"` | Require the mapper to be generated for this field; generation fails if it cannot be mapped. |
 | `copier:"override"` | Copy zero values even with `IgnoreEmpty`. |
+| `copier:"init_slice"` | Initialize a destination slice as empty instead of nil when the source slice is nil. |
 | `copier:"OtherName"` | Map fields by explicit name. |
 
 Supported options:
@@ -175,6 +176,8 @@ Supported deep-copy cases include:
 - slices with assignable or convertible element types
 - slices using a registered element converter, including pointer/value element
   converter fallbacks
+- destination slices tagged `copier:"init_slice"` are initialized as empty
+  slices when the source slice is nil
 - numeric conversions supported by Go, including fields inside nested generic
   structs such as `Range[uint] -> Range[uint8]`
 
