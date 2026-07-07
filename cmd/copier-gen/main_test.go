@@ -2011,6 +2011,218 @@ func Cast(src *Survey) error {
 	}
 }
 
+func TestRenderPrefersElementConverterOverNestedSliceMapping(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type VotingPoint struct {
+	ID          int
+	Title       string
+	Description string
+}
+
+type Voting struct {
+	Points []*VotingPoint
+}
+
+type VotingPointResponse struct {
+	ID          int
+	Title       string
+	Description string
+}
+
+type VotingResponse struct {
+	Points []VotingPointResponse
+}
+
+func Cast(src *Voting) error {
+	dst := &VotingResponse{}
+	return copier.Copy(dst, src, copier.Option{
+		DeepCopy: true,
+		Converters: copier.Converters{
+			copier.UseConverter(func(s *VotingPoint) (VotingPointResponse, error) {
+				return VotingPointResponse{
+					ID:          s.ID,
+					Title:       "converted " + s.Title,
+					Description: s.Description,
+				}, nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 0 {
+		t.Fatalf("expected converter to be used, got warnings: %v", m.warnings)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"converter, ok := copier.FindConverter[*VotingPoint, VotingPointResponse](opt.Converters)",
+		"convertedItem, err := converter(item)",
+		"converted = append(converted, convertedItem)",
+		"to.Points = converted",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestLoadModelWarnsAboutUnusedCallSiteConverter(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{
+		Converters: copier.Converters{
+			copier.UseConverter(func(src int) (string, error) {
+				return "", nil
+			}),
+		},
+	})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 1 {
+		t.Fatalf("expected one warning, got %d: %v", len(m.warnings), m.warnings)
+	}
+	for _, want := range []string{
+		filepath.Join(dir, "sample.go"),
+		"converter func(src int) (string, error)",
+		"int -> string",
+		"was provided but not used",
+	} {
+		if !strings.Contains(m.warnings[0], want) {
+			t.Fatalf("warning does not contain %q: %s", want, m.warnings[0])
+		}
+	}
+}
+
+func TestLoadModelWarnsAboutUnwrittenDestinationField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name    string
+	Missing string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 1 {
+		t.Fatalf("expected one warning, got %d: %v", len(m.warnings), m.warnings)
+	}
+	for _, want := range []string{
+		filepath.Join(dir, "sample.go"),
+		"destination field Missing is not written",
+		"sample.Source -> sample.Destination",
+		"source field Missing was not found",
+	} {
+		if !strings.Contains(m.warnings[0], want) {
+			t.Fatalf("warning does not contain %q: %s", want, m.warnings[0])
+		}
+	}
+}
+
+func TestLoadModelWarnsAboutUnwrittenNestedDestinationField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type SourceChild struct {
+	Name string
+}
+
+type Source struct {
+	Child *SourceChild
+}
+
+type DestinationChild struct {
+	Name    string
+	Missing string
+}
+
+type Destination struct {
+	Child DestinationChild
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 1 {
+		t.Fatalf("expected one warning, got %d: %v", len(m.warnings), m.warnings)
+	}
+	for _, want := range []string{
+		filepath.Join(dir, "sample.go"),
+		"destination field Child.Missing is not written",
+		"sample.Source -> sample.Destination",
+		"source field Missing was not found",
+	} {
+		if !strings.Contains(m.warnings[0], want) {
+			t.Fatalf("warning does not contain %q: %s", want, m.warnings[0])
+		}
+	}
+}
+
 func TestLoadModelFailsWhenRequiredConverterIsMissing(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample

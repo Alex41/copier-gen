@@ -46,6 +46,7 @@ type model struct {
 	nestedSet  bool
 	imports    map[string]string
 	issues     []string
+	warnings   []string
 	converters map[string]staticConverter
 }
 
@@ -69,6 +70,7 @@ type copyPair struct {
 	deepCopy     bool
 	fields       []fieldCopy
 	converters   map[string]staticConverter
+	warnings     []string
 	sourceFile   string
 	discoveredAt string
 }
@@ -145,6 +147,9 @@ func main() {
 	if len(m.issues) > 0 {
 		fatalf("found copier calls, but could not generate mappers:\n%s", strings.Join(m.issues, "\n"))
 	}
+	for _, warning := range m.warnings {
+		fmt.Fprintf(os.Stderr, "copier-gen: warning: %s\n", warning)
+	}
 	if len(m.pairs) == 0 {
 		fatalf("no copier.Copy calls found; pass -pair Src:Dst for an explicit mapper")
 	}
@@ -218,6 +223,8 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 		if err != nil {
 			return model{}, generationError{err: pairBuildError(pair, err)}
 		}
+		m.warnings = append(m.warnings, built.warnings...)
+		m.warnings = append(m.warnings, unusedConverterWarnings(pair, built)...)
 		m.pairs = append(m.pairs, built)
 	}
 	for _, raw := range rawPairs {
@@ -333,6 +340,8 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 		if err != nil {
 			return model{}, pairBuildError(pair, err)
 		}
+		m.warnings = append(m.warnings, built.warnings...)
+		m.warnings = append(m.warnings, unusedConverterWarnings(pair, built)...)
 		m.pairs = append(m.pairs, built)
 	}
 
@@ -964,6 +973,9 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 		srcField, insensitive, ok := findSourceField(pair.src, srcFieldName, srcTags)
 		if !ok {
 			if flags&tagMust == 0 {
+				pair.warnings = append(pair.warnings, skippedDestinationFieldWarning(
+					pair.discoveredAt, pair.srcType, pair.dstType, dstField.Name(), srcFieldName,
+				))
 				continue
 			}
 			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: destination field %s has no source field %s",
@@ -980,12 +992,12 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 		}
 
 		if pair.deepCopy && needsDeepCopy(srcField.field.Type()) {
-			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters); ok {
-				pair.fields = append(pair.fields, field)
-				continue
-			}
 			if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
 				pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter, argPtr, itemPtr))
+				continue
+			}
+			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters, &pair.warnings, pair); ok {
+				pair.fields = append(pair.fields, field)
 				continue
 			}
 			if assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), "from."+srcField.expr, currentPkg); ok && assign.nilSafe {
@@ -998,14 +1010,14 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 
 		assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), "from."+srcField.expr, currentPkg)
 		if !ok {
+			if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+				pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter, argPtr, itemPtr))
+				continue
+			}
 			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopies(
-				srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg, converters,
+				srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg, converters, &pair.warnings, pair,
 			)
 			if !nestedOK {
-				if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
-					pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter, argPtr, itemPtr))
-					continue
-				}
 				{
 					return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s needs converter %s -> %s",
 						typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), typeKey(srcField.field.Type()), typeKey(dstField.Type()))
@@ -1149,10 +1161,12 @@ func deepFieldCopy(
 	insensitive bool,
 	currentPkg string,
 	converters map[string]staticConverter,
+	warnings *[]string,
+	pair copyPair,
 ) (fieldCopy, bool) {
 	srcExpr := "from." + srcField.expr
 	if nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(
-		srcField.field.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg, converters,
+		srcField.field.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg, converters, warnings, pair,
 	); ok {
 		return nestedCopyField(srcField, dstField, flags, insensitive, nested, nestedPtr, nestedAlloc, currentPkg), true
 	}
@@ -1170,7 +1184,7 @@ func deepFieldCopy(
 		field.importTypes = append(field.importTypes, dstField.Type())
 		return field, true
 	}
-	if field, ok := sliceNestedFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters); ok {
+	if field, ok := sliceNestedFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters, warnings, pair); ok {
 		return field, true
 	}
 	return fieldCopy{}, false
@@ -1183,9 +1197,11 @@ func sliceNestedFieldCopy(
 	insensitive bool,
 	currentPkg string,
 	converters map[string]staticConverter,
+	warnings *[]string,
+	pair copyPair,
 ) (fieldCopy, bool) {
 	return sliceNestedFieldCopyValues(
-		srcField.field.Name(), "from."+srcField.expr, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters,
+		srcField.field.Name(), "from."+srcField.expr, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair,
 	)
 }
 
@@ -1198,6 +1214,8 @@ func sliceNestedFieldCopyValues(
 	insensitive bool,
 	currentPkg string,
 	converters map[string]staticConverter,
+	warnings *[]string,
+	pair copyPair,
 ) (fieldCopy, bool) {
 	srcSlice, ok := srcType.Underlying().(*types.Slice)
 	if !ok {
@@ -1210,7 +1228,7 @@ func sliceNestedFieldCopyValues(
 	srcElem := srcSlice.Elem()
 	dstElem := dstSlice.Elem()
 	nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(
-		srcElem, dstElem, "item", "convertedItem", currentPkg, converters,
+		srcElem, dstElem, "item", "convertedItem", currentPkg, converters, warnings, pair,
 	)
 	if !ok {
 		return fieldCopy{}, false
@@ -1280,14 +1298,18 @@ func nestedFieldCopies(
 	src, dst types.Type,
 	srcExpr, dstPrefix, currentPkg string,
 	converters map[string]staticConverter,
+	warnings *[]string,
+	pair copyPair,
 ) ([]fieldCopy, bool, string, bool) {
-	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, converters, 0)
+	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, converters, warnings, pair, 0)
 }
 
 func nestedFieldCopiesDepth(
 	src, dst types.Type,
 	srcExpr, dstPrefix, currentPkg string,
 	converters map[string]staticConverter,
+	warnings *[]string,
+	pair copyPair,
 	depth int,
 ) ([]fieldCopy, bool, string, bool) {
 	if depth > 8 {
@@ -1340,6 +1362,11 @@ func nestedFieldCopiesDepth(
 			if flags&tagMust != 0 {
 				return nil, false, "", false
 			}
+			if warnings != nil {
+				*warnings = append(*warnings, skippedDestinationFieldWarning(
+					pair.discoveredAt, pair.srcType, pair.dstType, dstPrefix+"."+dstField.Name(), srcFieldName,
+				))
+			}
 			continue
 		}
 		source := srcExpr + "." + srcField.expr
@@ -1359,21 +1386,21 @@ func nestedFieldCopiesDepth(
 		}
 		assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), source, currentPkg)
 		if !ok {
+			if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+				field := sliceConverterFieldCopyValues(
+					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, converter, argPtr, itemPtr,
+				)
+				field.dstName = dstPrefix + "." + dstField.Name()
+				fields = append(fields, field)
+				continue
+			}
 			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(
-				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, depth+1,
+				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, warnings, pair, depth+1,
 			)
 			if !nestedOK {
 				if field, ok := sliceNestedFieldCopyValues(
-					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters,
+					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair,
 				); ok {
-					field.dstName = dstPrefix + "." + dstField.Name()
-					fields = append(fields, field)
-					continue
-				}
-				if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
-					field := sliceConverterFieldCopyValues(
-						srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, converter, argPtr, itemPtr,
-					)
 					field.dstName = dstPrefix + "." + dstField.Name()
 					fields = append(fields, field)
 					continue
@@ -2196,6 +2223,62 @@ func typeKey(t types.Type) string {
 
 func converterKey(src, dst types.Type) string {
 	return typeKey(src) + "->" + typeKey(dst)
+}
+
+func skippedDestinationFieldWarning(location string, srcType, dstType types.Type, dstField, srcField string) string {
+	if location == "" {
+		location = "-"
+	}
+	return fmt.Sprintf(
+		"%s: destination field %s is not written in mapper %s -> %s: source field %s was not found",
+		location,
+		dstField,
+		typeKey(srcType),
+		typeKey(dstType),
+		srcField,
+	)
+}
+
+func unusedConverterWarnings(discovered, built copyPair) []string {
+	if len(discovered.converters) == 0 {
+		return nil
+	}
+	used := map[string]bool{}
+	collectUsedConverterKeys(used, built.fields)
+	keys := make([]string, 0, len(discovered.converters))
+	for key := range discovered.converters {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	var warnings []string
+	for _, key := range keys {
+		if used[key] {
+			continue
+		}
+		converter := discovered.converters[key]
+		location := discovered.discoveredAt
+		if location == "" {
+			location = "-"
+		}
+		warnings = append(warnings, fmt.Sprintf(
+			"%s: converter %s for %s -> %s was provided but not used",
+			location,
+			converter.fn,
+			typeKey(converter.srcType),
+			typeKey(converter.dstType),
+		))
+	}
+	return warnings
+}
+
+func collectUsedConverterKeys(used map[string]bool, fields []fieldCopy) {
+	for _, field := range fields {
+		if field.converter {
+			used[converterKey(field.converterSrcType, field.converterDstType)] = true
+		}
+		collectUsedConverterKeys(used, field.nested)
+	}
 }
 
 func copyPairKey(pair copyPair) string {

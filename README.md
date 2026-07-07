@@ -134,6 +134,10 @@ Converter rules:
   `*Src -> Dst`, `*Src -> *Dst`, and `Src -> *Dst`
 - generated code performs a typed lookup in the current call's
   `opt.Converters`; it does not use reflection
+- generation prints a warning when a converter passed in a `Copy` call's
+  `Option.Converters` is not used by the generated mapper
+- generation prints a warning when a destination field is not written because
+  no matching source field was found
 - if a required converter cannot be resolved during generation, generation
   fails
 - if generated code expects a call-site converter but the runtime options do
