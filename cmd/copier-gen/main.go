@@ -50,6 +50,10 @@ type model struct {
 	converters map[string]staticConverter
 }
 
+type generationOptions struct {
+	disableUnusedFieldWarn bool
+}
+
 type generationError struct {
 	err error
 }
@@ -131,16 +135,23 @@ const (
 	tagOverride
 	tagMust
 	tagInitSlice
+	tagNoWarn
 )
 
 func main() {
 	var pairs pairFlag
 	out := flag.String("out", "", "generated file path; defaults to <source>_copier_gen.go per source file")
 	dir := flag.String("dir", ".", "package directory")
+	noUnusedFieldWarn := flag.Bool("no_unused_field_warn", false, "disable warnings for destination fields that are not written because no source field was found")
 	flag.Var(&pairs, "pair", "copy pair as Src:Dst; optional, generator also scans copier.Copy calls")
 	flag.Parse()
 
-	m, err := loadModel(*dir, pairs)
+	opts := defaultGenerationOptions()
+	if *noUnusedFieldWarn {
+		opts.disableUnusedFieldWarn = true
+	}
+
+	m, err := loadModelWithOptions(*dir, pairs, opts)
 	if err != nil {
 		fatalf("%v", err)
 	}
@@ -160,11 +171,30 @@ func main() {
 }
 
 func loadModel(dir string, rawPairs []string) (model, error) {
-	if m, err := loadModelPackages(dir, rawPairs); err == nil {
+	return loadModelWithOptions(dir, rawPairs, defaultGenerationOptions())
+}
+
+func defaultGenerationOptions() generationOptions {
+	return generationOptions{
+		disableUnusedFieldWarn: envBool("DISABLE_UNUSED_FIELD_WARN"),
+	}
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func loadModelWithOptions(dir string, rawPairs []string, opts generationOptions) (model, error) {
+	if m, err := loadModelPackages(dir, rawPairs, opts); err == nil {
 		if len(m.pairs) > 0 || len(rawPairs) > 0 {
 			return m, nil
 		}
-		fallback, fallbackErr := loadModelStd(dir, rawPairs)
+		fallback, fallbackErr := loadModelStd(dir, rawPairs, opts)
 		if fallbackErr != nil {
 			return fallback, fallbackErr
 		}
@@ -176,10 +206,10 @@ func loadModel(dir string, rawPairs []string) (model, error) {
 			return model{}, genErr.err
 		}
 	}
-	return loadModelStd(dir, rawPairs)
+	return loadModelStd(dir, rawPairs, opts)
 }
 
-func loadModelPackages(dir string, rawPairs []string) (model, error) {
+func loadModelPackages(dir string, rawPairs []string, opts generationOptions) (model, error) {
 	overlay, err := generatedFileOverlay(dir)
 	if err != nil {
 		return model{}, err
@@ -219,7 +249,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 			continue
 		}
 		seen[key] = true
-		built, err := buildPairFromTypes(pair, pkg.PkgPath, mergeConverters(m.converters, pair.converters))
+		built, err := buildPairFromTypes(pair, pkg.PkgPath, mergeConverters(m.converters, pair.converters), opts)
 		if err != nil {
 			return model{}, generationError{err: pairBuildError(pair, err)}
 		}
@@ -229,7 +259,7 @@ func loadModelPackages(dir string, rawPairs []string) (model, error) {
 	}
 	for _, raw := range rawPairs {
 		parts := strings.SplitN(raw, ":", 2)
-		pair, err := buildPair(pkg.Types, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), m.converters)
+		pair, err := buildPair(pkg.Types, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), m.converters, opts)
 		if err != nil {
 			return model{}, err
 		}
@@ -286,7 +316,7 @@ func isGeneratedGoFile(name string) bool {
 	return strings.HasSuffix(name, "_gen.go")
 }
 
-func loadModelStd(dir string, rawPairs []string) (model, error) {
+func loadModelStd(dir string, rawPairs []string, opts generationOptions) (model, error) {
 	fset := token.NewFileSet()
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -336,7 +366,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 			continue
 		}
 		seen[key] = true
-		built, err := buildPairFromTypes(pair, pkg.Path(), mergeConverters(m.converters, pair.converters))
+		built, err := buildPairFromTypes(pair, pkg.Path(), mergeConverters(m.converters, pair.converters), opts)
 		if err != nil {
 			return model{}, pairBuildError(pair, err)
 		}
@@ -347,7 +377,7 @@ func loadModelStd(dir string, rawPairs []string) (model, error) {
 
 	for _, raw := range rawPairs {
 		parts := strings.SplitN(raw, ":", 2)
-		pair, err := buildPair(pkg, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), m.converters)
+		pair, err := buildPair(pkg, strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]), m.converters, opts)
 		if err != nil {
 			return model{}, err
 		}
@@ -925,7 +955,7 @@ func namedStructDestination(t types.Type) (*types.Named, bool, bool) {
 	return named, indirect, true
 }
 
-func buildPair(pkg *types.Package, srcName, dstName string, converters map[string]staticConverter) (copyPair, error) {
+func buildPair(pkg *types.Package, srcName, dstName string, converters map[string]staticConverter, opts generationOptions) (copyPair, error) {
 	srcNamed, srcStruct, err := lookupStruct(pkg, srcName)
 	if err != nil {
 		return copyPair{}, err
@@ -941,10 +971,10 @@ func buildPair(pkg *types.Package, srcName, dstName string, converters map[strin
 		dstType: dstNamed,
 		src:     srcStruct,
 		dst:     dstStruct,
-	}, pkg.Path(), converters)
+	}, pkg.Path(), converters, opts)
 }
 
-func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]staticConverter) (copyPair, error) {
+func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]staticConverter, opts generationOptions) (copyPair, error) {
 	srcTags, err := structTags(pair.src)
 	if err != nil {
 		return copyPair{}, err
@@ -973,9 +1003,11 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 		srcField, insensitive, ok := findSourceField(pair.src, srcFieldName, srcTags)
 		if !ok {
 			if flags&tagMust == 0 {
-				pair.warnings = append(pair.warnings, skippedDestinationFieldWarning(
-					pair.discoveredAt, pair.srcType, pair.dstType, dstField.Name(), srcFieldName,
-				))
+				if shouldWarnUnusedField(flags, opts) {
+					pair.warnings = append(pair.warnings, skippedDestinationFieldWarning(
+						pair.discoveredAt, pair.srcType, pair.dstType, dstField.Name(), srcFieldName,
+					))
+				}
 				continue
 			}
 			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: destination field %s has no source field %s",
@@ -996,7 +1028,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				pair.fields = append(pair.fields, sliceConverterFieldCopy(srcField, dstField, flags, insensitive, converter, argPtr, itemPtr))
 				continue
 			}
-			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters, &pair.warnings, pair); ok {
+			if field, ok := deepFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters, &pair.warnings, pair, opts); ok {
 				pair.fields = append(pair.fields, field)
 				continue
 			}
@@ -1015,7 +1047,7 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				continue
 			}
 			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopies(
-				srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg, converters, &pair.warnings, pair,
+				srcField.field.Type(), dstField.Type(), "from."+srcField.expr, dstField.Name(), currentPkg, converters, &pair.warnings, pair, opts,
 			)
 			if !nestedOK {
 				{
@@ -1163,10 +1195,11 @@ func deepFieldCopy(
 	converters map[string]staticConverter,
 	warnings *[]string,
 	pair copyPair,
+	opts generationOptions,
 ) (fieldCopy, bool) {
 	srcExpr := "from." + srcField.expr
 	if nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(
-		srcField.field.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg, converters, warnings, pair,
+		srcField.field.Type(), dstField.Type(), srcExpr, dstField.Name(), currentPkg, converters, warnings, pair, opts,
 	); ok {
 		return nestedCopyField(srcField, dstField, flags, insensitive, nested, nestedPtr, nestedAlloc, currentPkg), true
 	}
@@ -1184,7 +1217,7 @@ func deepFieldCopy(
 		field.importTypes = append(field.importTypes, dstField.Type())
 		return field, true
 	}
-	if field, ok := sliceNestedFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters, warnings, pair); ok {
+	if field, ok := sliceNestedFieldCopy(srcField, dstField, flags, insensitive, currentPkg, converters, warnings, pair, opts); ok {
 		return field, true
 	}
 	return fieldCopy{}, false
@@ -1199,9 +1232,10 @@ func sliceNestedFieldCopy(
 	converters map[string]staticConverter,
 	warnings *[]string,
 	pair copyPair,
+	opts generationOptions,
 ) (fieldCopy, bool) {
 	return sliceNestedFieldCopyValues(
-		srcField.field.Name(), "from."+srcField.expr, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair,
+		srcField.field.Name(), "from."+srcField.expr, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair, opts,
 	)
 }
 
@@ -1216,6 +1250,7 @@ func sliceNestedFieldCopyValues(
 	converters map[string]staticConverter,
 	warnings *[]string,
 	pair copyPair,
+	opts generationOptions,
 ) (fieldCopy, bool) {
 	srcSlice, ok := srcType.Underlying().(*types.Slice)
 	if !ok {
@@ -1228,7 +1263,7 @@ func sliceNestedFieldCopyValues(
 	srcElem := srcSlice.Elem()
 	dstElem := dstSlice.Elem()
 	nested, nestedPtr, nestedAlloc, ok := nestedFieldCopies(
-		srcElem, dstElem, "item", "convertedItem", currentPkg, converters, warnings, pair,
+		srcElem, dstElem, "item", "convertedItem", currentPkg, converters, warnings, pair, opts,
 	)
 	if !ok {
 		return fieldCopy{}, false
@@ -1300,8 +1335,9 @@ func nestedFieldCopies(
 	converters map[string]staticConverter,
 	warnings *[]string,
 	pair copyPair,
+	opts generationOptions,
 ) ([]fieldCopy, bool, string, bool) {
-	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, converters, warnings, pair, 0)
+	return nestedFieldCopiesDepth(src, dst, srcExpr, dstPrefix, currentPkg, converters, warnings, pair, opts, 0)
 }
 
 func nestedFieldCopiesDepth(
@@ -1310,6 +1346,7 @@ func nestedFieldCopiesDepth(
 	converters map[string]staticConverter,
 	warnings *[]string,
 	pair copyPair,
+	opts generationOptions,
 	depth int,
 ) ([]fieldCopy, bool, string, bool) {
 	if depth > 8 {
@@ -1362,7 +1399,7 @@ func nestedFieldCopiesDepth(
 			if flags&tagMust != 0 {
 				return nil, false, "", false
 			}
-			if warnings != nil {
+			if warnings != nil && shouldWarnUnusedField(flags, opts) {
 				*warnings = append(*warnings, skippedDestinationFieldWarning(
 					pair.discoveredAt, pair.srcType, pair.dstType, dstPrefix+"."+dstField.Name(), srcFieldName,
 				))
@@ -1395,11 +1432,11 @@ func nestedFieldCopiesDepth(
 				continue
 			}
 			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(
-				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, warnings, pair, depth+1,
+				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, warnings, pair, opts, depth+1,
 			)
 			if !nestedOK {
 				if field, ok := sliceNestedFieldCopyValues(
-					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair,
+					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair, opts,
 				); ok {
 					field.dstName = dstPrefix + "." + dstField.Name()
 					fields = append(fields, field)
@@ -1535,6 +1572,8 @@ func parseTag(tag string) (tagInfo, error) {
 			info.flags |= tagOverride
 		case "init_slice":
 			info.flags |= tagInitSlice
+		case "no_warn":
+			info.flags |= tagNoWarn
 		default:
 			r := []rune(part)
 			if len(r) == 0 || !unicode.IsUpper(r[0]) {
@@ -1544,6 +1583,10 @@ func parseTag(tag string) (tagInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+func shouldWarnUnusedField(flags uint8, opts generationOptions) bool {
+	return !opts.disableUnusedFieldWarn && flags&tagNoWarn == 0
 }
 
 func isSliceType(t types.Type) bool {

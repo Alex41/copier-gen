@@ -2172,6 +2172,113 @@ func Cast(src Source) error {
 	}
 }
 
+func TestLoadModelSuppressesUnwrittenDestinationFieldWarningWithTag(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name    string
+	Missing string ` + "`copier:\"no_warn\"`" + `
+	Other   string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 1 {
+		t.Fatalf("expected one warning, got %d: %v", len(m.warnings), m.warnings)
+	}
+	if strings.Contains(m.warnings[0], "Missing") {
+		t.Fatalf("no_warn field still produced a warning: %v", m.warnings)
+	}
+	if !strings.Contains(m.warnings[0], "Other") {
+		t.Fatalf("expected warning for Other field, got: %v", m.warnings)
+	}
+}
+
+func TestLoadModelSuppressesUnwrittenDestinationFieldWarningWithOption(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name    string
+	Missing string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModelWithOptions(dir, nil, generationOptions{disableUnusedFieldWarn: true})
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 0 {
+		t.Fatalf("expected no warnings, got %d: %v", len(m.warnings), m.warnings)
+	}
+}
+
+func TestLoadModelSuppressesUnwrittenDestinationFieldWarningWithEnv(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name    string
+	Missing string
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DISABLE_UNUSED_FIELD_WARN", "1")
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 0 {
+		t.Fatalf("expected no warnings, got %d: %v", len(m.warnings), m.warnings)
+	}
+}
+
 func TestLoadModelWarnsAboutUnwrittenNestedDestinationField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
@@ -2220,6 +2327,47 @@ func Cast(src Source) error {
 		if !strings.Contains(m.warnings[0], want) {
 			t.Fatalf("warning does not contain %q: %s", want, m.warnings[0])
 		}
+	}
+}
+
+func TestLoadModelSuppressesUnwrittenNestedDestinationFieldWarningWithTag(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type SourceChild struct {
+	Name string
+}
+
+type Source struct {
+	Child *SourceChild
+}
+
+type DestinationChild struct {
+	Name    string
+	Missing string ` + "`copier:\"no_warn\"`" + `
+}
+
+type Destination struct {
+	Child DestinationChild
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	if len(m.warnings) != 0 {
+		t.Fatalf("expected no warnings, got %d: %v", len(m.warnings), m.warnings)
 	}
 }
 
