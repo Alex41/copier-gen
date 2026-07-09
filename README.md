@@ -17,6 +17,10 @@ Run:
 go generate ./...
 ```
 
+To suppress warnings for destination fields that are not written because no
+matching source field exists, run the generator with `-no_unused_field_warn` or
+set `DISABLE_UNUSED_FIELD_WARN=1`.
+
 The generator scans call sites, infers the concrete source and destination
 types, writes generated files next to their source files, and creates:
 
@@ -137,7 +141,8 @@ Converter rules:
 - generation prints a warning when a converter passed in a `Copy` call's
   `Option.Converters` is not used by the generated mapper
 - generation prints a warning when a destination field is not written because
-  no matching source field was found
+  no matching source field was found, unless disabled by `copier:"no_warn"`,
+  `-no_unused_field_warn`, or `DISABLE_UNUSED_FIELD_WARN=1`
 - if a required converter cannot be resolved during generation, generation
   fails
 - if generated code expects a call-site converter but the runtime options do
@@ -153,6 +158,7 @@ Generated code supports the copier tags:
 | `copier:"must"` | Require the mapper to be generated for this field; generation fails if it cannot be mapped. |
 | `copier:"override"` | Copy zero values even with `IgnoreEmpty`. |
 | `copier:"init_slice"` | Initialize a destination slice as empty instead of nil when the source slice is nil. |
+| `copier:"no_warn"` | Suppress generation warnings for this destination field. |
 | `copier:"OtherName"` | Map fields by explicit name. |
 
 Supported options:

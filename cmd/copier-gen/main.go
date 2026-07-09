@@ -2169,7 +2169,9 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 		fmt.Fprintf(b, "if %s != nil {\n", field.srcExpr)
 		toExpr := "&to." + field.dstName
 		if field.nestedPtr {
+			fmt.Fprintf(b, "if to.%s == nil {\n", field.dstName)
 			fmt.Fprintf(b, "to.%s = new(%s)\n", field.dstName, field.nestedAlloc)
+			fmt.Fprintln(b, "}")
 			toExpr = "to." + field.dstName
 		}
 		fmt.Fprintf(b, "if err := %s(%s, %s, opt); err != nil { return err }\n",

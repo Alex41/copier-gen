@@ -668,6 +668,7 @@ func Cast(src Source) error {
 	helper := nestedMapperNameForField(nested)
 	for _, want := range []string{
 		"if from.FileLimit != nil",
+		"if to.FileLimit == nil",
 		"to.FileLimit = new(Range[uint8])",
 		"func " + helper + "(to *Range[uint8], from *Range[uint], opt copier.Option) error",
 		"to.From = uint8(from.From)",
