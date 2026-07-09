@@ -1411,6 +1411,68 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderDeepCopyStructContainingTimePointerField(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import (
+	"time"
+
+	copier "github.com/Alex41/copier-gen"
+)
+
+type Schedule struct {
+	StartsAt time.Time
+}
+
+type Source struct {
+	Schedule *Schedule
+}
+
+type Destination struct {
+	Schedule *Schedule
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Schedule != nil",
+		"if to.Schedule == nil",
+		"to.Schedule = new(Schedule)",
+		"to.StartsAt = from.StartsAt",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	for _, unwanted := range []string{
+		"to.wall",
+		"to.ext",
+		"to.loc",
+		"source field wall was not found",
+	} {
+		if strings.Contains(text, unwanted) {
+			t.Fatalf("generated output appears to decompose time.Time via %q:\n%s", unwanted, text)
+		}
+	}
+}
+
 func TestRenderDeepCopyPointerToValueField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample
