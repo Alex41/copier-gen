@@ -1302,6 +1302,64 @@ func Cast(src Source) error {
 	}
 }
 
+func TestRenderDeepCopyNestedPointerStructFieldPreservesDestination(t *testing.T) {
+	dir := t.TempDir()
+	src := `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Text struct {
+	Value *string
+	Color *string
+}
+
+type Block struct {
+	Subtitle *Text
+}
+
+type Source struct {
+	Block *Block
+}
+
+type Destination struct {
+	Block *Block
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{DeepCopy: true})
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	text := string(out)
+	for _, want := range []string{
+		"if from.Subtitle != nil",
+		"if to.Subtitle == nil",
+		"to.Subtitle = new(Text)",
+		"if err := ",
+		"(to.Subtitle, from.Subtitle, opt); err != nil {",
+		"return err",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "to.Subtitle = from.Subtitle") {
+		t.Fatalf("generated output used shallow nested pointer assignment:\n%s", text)
+	}
+}
+
 func TestRenderDeepCopyTimePointerField(t *testing.T) {
 	dir := t.TempDir()
 	src := `package sample

@@ -1421,29 +1421,9 @@ func nestedFieldCopiesDepth(
 			fields = append(fields, field)
 			continue
 		}
-		assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), source, currentPkg)
-		if !ok {
-			if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
-				field := sliceConverterFieldCopyValues(
-					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, converter, argPtr, itemPtr,
-				)
-				field.dstName = dstPrefix + "." + dstField.Name()
-				fields = append(fields, field)
-				continue
-			}
-			nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(
-				srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, warnings, pair, opts, depth+1,
-			)
-			if !nestedOK {
-				if field, ok := sliceNestedFieldCopyValues(
-					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair, opts,
-				); ok {
-					field.dstName = dstPrefix + "." + dstField.Name()
-					fields = append(fields, field)
-					continue
-				}
-				return nil, false, "", false
-			}
+		if nested, nestedPtr, nestedAlloc, nestedOK := nestedFieldCopiesDepth(
+			srcField.field.Type(), dstField.Type(), source, dstPrefix+"."+dstField.Name(), currentPkg, converters, warnings, pair, opts, depth+1,
+		); nestedOK {
 			field := baseFieldCopyValues(
 				srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive,
 			)
@@ -1456,6 +1436,25 @@ func nestedFieldCopiesDepth(
 			field.importTypes = []types.Type{dstField.Type()}
 			fields = append(fields, field)
 			continue
+		}
+		assign, ok := assignmentExpr(srcField.field.Type(), dstField.Type(), source, currentPkg)
+		if !ok {
+			if converter, argPtr, itemPtr, ok := sliceElementConverter(srcField.field.Type(), dstField.Type(), converters); ok {
+				field := sliceConverterFieldCopyValues(
+					srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, converter, argPtr, itemPtr,
+				)
+				field.dstName = dstPrefix + "." + dstField.Name()
+				fields = append(fields, field)
+				continue
+			}
+			if field, ok := sliceNestedFieldCopyValues(
+				srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive, currentPkg, converters, warnings, pair, opts,
+			); ok {
+				field.dstName = dstPrefix + "." + dstField.Name()
+				fields = append(fields, field)
+				continue
+			}
+			return nil, false, "", false
 		}
 		field := assignmentFieldCopyValues(srcField.field.Name(), source, srcField.field.Type(), dstField, assign)
 		field.dstName = dstPrefix + "." + dstField.Name()
