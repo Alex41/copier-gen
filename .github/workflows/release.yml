@@ -1,0 +1,59 @@
+name: Release
+
+# Every push to master that passes the tests becomes a GitHub release of the
+# next patch version after the latest vX.Y.Z (v0.0.23 → v0.0.24); the release
+# creates its tag, notes are generated from the commits since the previous one.
+# A minor or major bump is a release made by hand.
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - run: go vet ./...
+
+      - run: go test -race -count=1 ./...
+
+  release:
+    needs: test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release the next patch version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git tag --points-at HEAD | grep -qE '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "HEAD is already released"
+            exit 0
+          fi
+          last=$(git tag --list 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "$last" ]; then
+            echo "::error::no vX.Y.Z tag to continue from"
+            exit 1
+          fi
+          IFS=. read -r major minor patch <<< "${last#v}"
+          next="v$major.$minor.$((patch + 1))"
+          echo "releasing $next"
+          gh release create "$next" --target "$GITHUB_SHA" --title "$next" --generate-notes --notes-start-tag "$last"

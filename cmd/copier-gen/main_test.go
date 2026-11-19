@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"go/token"
 	"go/types"
 	"os"
@@ -86,6 +87,7 @@ func TestRenderDoesNotImportDirectAssignmentFieldTypes(t *testing.T) {
 	src := `package sample
 
 import (
+	"fmt"
 	"time"
 
 	copier "github.com/Alex41/copier-gen"
@@ -1021,6 +1023,7 @@ func TestRenderUsesTypedContextConverterForIncompatibleField(t *testing.T) {
 	src := `package sample
 
 import (
+	"fmt"
 	"context"
 
 	copier "github.com/Alex41/copier-gen"
@@ -1089,6 +1092,7 @@ func TestRenderInfersContextConverterTypes(t *testing.T) {
 	src := `package sample
 
 import (
+	"fmt"
 	"context"
 
 	copier "github.com/Alex41/copier-gen"
@@ -1365,6 +1369,7 @@ func TestRenderDeepCopyTimePointerField(t *testing.T) {
 	src := `package sample
 
 import (
+	"fmt"
 	"time"
 
 	copier "github.com/Alex41/copier-gen"
@@ -1416,6 +1421,7 @@ func TestRenderDeepCopyStructContainingTimePointerField(t *testing.T) {
 	src := `package sample
 
 import (
+	"fmt"
 	"time"
 
 	copier "github.com/Alex41/copier-gen"
@@ -2634,5 +2640,151 @@ func minimalPair(srcName, dstName, sourceFile string) copyPair {
 		src:        srcStruct,
 		dst:        dstStruct,
 		sourceFile: sourceFile,
+	}
+}
+
+func renderSample(t *testing.T, src string) (string, error) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte(src), 0644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := loadModel(dir, nil)
+	if err != nil {
+		return "", err
+	}
+	out, err := render(m)
+	if err != nil {
+		t.Fatalf("render returned error: %v", err)
+	}
+	return string(out), nil
+}
+
+func TestRenderNullIfZeroClearsTheDestination(t *testing.T) {
+	for _, deep := range []bool{false, true} {
+		text, err := renderSample(t, `package sample
+
+import (
+	"fmt"
+	"time"
+
+	copier "github.com/Alex41/copier-gen"
+)
+
+type Source struct {
+	Birthdate *time.Time
+}
+
+type Destination struct {
+	Birthdate *time.Time `+"`copier:\"null_if_zero\"`"+`
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{IgnoreEmpty: true, DeepCopy: `+fmt.Sprint(deep)+`})
+}
+`)
+		if err != nil {
+			t.Fatalf("deep=%v: loadModel returned error: %v", deep, err)
+		}
+		for _, want := range []string{
+			"if from.Birthdate != nil && from.Birthdate.IsZero() {",
+			"to.Birthdate = nil",
+		} {
+			if !strings.Contains(text, want) {
+				t.Fatalf("deep=%v: generated output does not contain %q:\n%s", deep, want, text)
+			}
+		}
+	}
+}
+
+func TestLoadModelRejectsNullIfZeroWithoutIsZero(t *testing.T) {
+	_, err := renderSample(t, `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name *string
+}
+
+type Destination struct {
+	Name *string `+"`copier:\"null_if_zero\"`"+`
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`)
+	if err == nil || !strings.Contains(err.Error(), "null_if_zero needs a pointer source whose type has IsZero() bool") {
+		t.Fatalf("expected a null_if_zero error, got %v", err)
+	}
+}
+
+func TestRenderMergeCopiesAnEmbeddedStructFieldByField(t *testing.T) {
+	text, err := renderSample(t, `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Inner struct {
+	Text *string
+	Icon *string
+}
+
+type Switcher struct {
+	Inner `+"`copier:\"merge\"`"+`
+	IsEnabled *bool
+}
+
+type Source struct {
+	Field *Switcher
+}
+
+type Destination struct {
+	Field Switcher
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src, copier.Option{IgnoreEmpty: true, DeepCopy: true})
+}
+`)
+	if err != nil {
+		t.Fatalf("loadModel returned error: %v", err)
+	}
+	for _, want := range []string{
+		"(&to.Inner, &from.Inner, opt)",
+		"to.Text = from.Text",
+		"to.Icon = from.Icon",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("generated output does not contain %q:\n%s", want, text)
+		}
+	}
+	if strings.Contains(text, "to.Inner = from.Inner") {
+		t.Fatalf("merge still assigns the struct whole:\n%s", text)
+	}
+}
+
+func TestLoadModelRejectsMergeOnANonStructField(t *testing.T) {
+	_, err := renderSample(t, `package sample
+
+import copier "github.com/Alex41/copier-gen"
+
+type Source struct {
+	Name string
+}
+
+type Destination struct {
+	Name string `+"`copier:\"merge\"`"+`
+}
+
+func Cast(src Source) error {
+	dst := &Destination{}
+	return copier.Copy(dst, src)
+}
+`)
+	if err == nil || !strings.Contains(err.Error(), "merge needs a struct value on both sides") {
+		t.Fatalf("expected a merge error, got %v", err)
 	}
 }

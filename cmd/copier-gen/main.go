@@ -99,6 +99,7 @@ type fieldCopy struct {
 	zeroAssign       string
 	nested           []fieldCopy
 	nestedPtr        bool
+	nestedValue      bool
 	nestedAlloc      string
 	nestedSrcType    types.Type
 	nestedDstType    types.Type
@@ -136,6 +137,8 @@ const (
 	tagMust
 	tagInitSlice
 	tagNoWarn
+	tagNullIfZero
+	tagMerge
 )
 
 func main() {
@@ -1014,6 +1017,19 @@ func buildPairFromTypes(pair copyPair, currentPkg string, converters map[string]
 				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), srcFieldName)
 		}
 
+		if err := checkFieldTags(flags, srcField.field.Type(), dstField.Type()); err != nil {
+			return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s: %w",
+				typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name(), err)
+		}
+		if flags&tagMerge != 0 {
+			field, ok := mergeFieldCopy(srcField.field.Name(), "from."+srcField.expr, srcField.field.Type(), dstField, dstField.Name(), flags, insensitive, currentPkg, converters, &pair.warnings, pair, opts, 0)
+			if !ok {
+				return copyPair{}, fmt.Errorf("cannot generate mapper %s -> %s: field %s: merge needs struct fields with something to copy",
+					typeKey(pair.srcType), typeKey(pair.dstType), dstField.Name())
+			}
+			pair.fields = append(pair.fields, field)
+			continue
+		}
 		if converter, ok := converters[converterKey(srcField.field.Type(), dstField.Type())]; ok {
 			pair.fields = append(pair.fields, converterFieldCopy(srcField, dstField, flags, insensitive, converter))
 			continue
@@ -1184,6 +1200,72 @@ func nestedCopyField(
 	field.nestedAlloc = nestedAlloc
 	field.importTypes = []types.Type{dstField.Type()}
 	return field
+}
+
+// checkFieldTags rejects a tag the field's types can't honour, at generation time.
+func checkFieldTags(flags uint8, src, dst types.Type) error {
+	if flags&tagNullIfZero != 0 {
+		if _, ok := src.(*types.Pointer); !ok || !hasIsZero(src) {
+			return fmt.Errorf("null_if_zero needs a pointer source whose type has IsZero() bool, got %s", typeKey(src))
+		}
+		if _, ok := dst.(*types.Pointer); !ok {
+			return fmt.Errorf("null_if_zero needs a pointer destination, got %s", typeKey(dst))
+		}
+	}
+	if flags&tagMerge != 0 {
+		_, srcOK := src.(*types.Named)
+		_, dstOK := dst.(*types.Named)
+		_, srcStruct := structType(src)
+		_, dstStruct := structType(dst)
+		if !srcOK || !dstOK || !srcStruct || !dstStruct {
+			return fmt.Errorf("merge needs a struct value on both sides, got %s -> %s", typeKey(src), typeKey(dst))
+		}
+	}
+	return nil
+}
+
+func hasIsZero(t types.Type) bool {
+	obj, _, _ := types.LookupFieldOrMethod(t, true, nil, "IsZero")
+	fn, ok := obj.(*types.Func)
+	if !ok {
+		return false
+	}
+	sig := fn.Type().(*types.Signature)
+	if sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+		return false
+	}
+	basic, ok := sig.Results().At(0).Type().(*types.Basic)
+	return ok && basic.Kind() == types.Bool
+}
+
+// mergeFieldCopy copies a struct value field by field through a nested mapper,
+// so IgnoreEmpty applies inside it, instead of assigning the struct whole.
+func mergeFieldCopy(
+	srcName string,
+	srcExpr string,
+	srcType types.Type,
+	dstField *types.Var,
+	dstName string,
+	flags uint8,
+	insensitive bool,
+	currentPkg string,
+	converters map[string]staticConverter,
+	warnings *[]string,
+	pair copyPair,
+	opts generationOptions,
+	depth int,
+) (fieldCopy, bool) {
+	srcPtr := types.NewPointer(srcType)
+	nested, _, _, ok := nestedFieldCopiesDepth(srcPtr, dstField.Type(), srcExpr, dstName, currentPkg, converters, warnings, pair, opts, depth)
+	if !ok {
+		return fieldCopy{}, false
+	}
+	field := baseFieldCopyValues(srcName, srcExpr, srcPtr, dstField, flags, insensitive)
+	field.dstName = dstName
+	field.nested = nested
+	field.nestedValue = true
+	field.importTypes = []types.Type{dstField.Type()}
+	return field, true
 }
 
 func deepFieldCopy(
@@ -1407,6 +1489,17 @@ func nestedFieldCopiesDepth(
 			continue
 		}
 		source := srcExpr + "." + srcField.expr
+		if checkFieldTags(flags, srcField.field.Type(), dstField.Type()) != nil {
+			return nil, false, "", false
+		}
+		if flags&tagMerge != 0 {
+			field, ok := mergeFieldCopy(srcField.field.Name(), source, srcField.field.Type(), dstField, dstPrefix+"."+dstField.Name(), flags, insensitive, currentPkg, converters, warnings, pair, opts, depth+1)
+			if !ok {
+				return nil, false, "", false
+			}
+			fields = append(fields, field)
+			continue
+		}
 		if converter, ok := converters[converterKey(srcField.field.Type(), dstField.Type())]; ok {
 			field := baseFieldCopyValues(srcField.field.Name(), source, srcField.field.Type(), dstField, flags, insensitive)
 			field.dstName = dstPrefix + "." + dstField.Name()
@@ -1573,6 +1666,10 @@ func parseTag(tag string) (tagInfo, error) {
 			info.flags |= tagInitSlice
 		case "no_warn":
 			info.flags |= tagNoWarn
+		case "null_if_zero":
+			info.flags |= tagNullIfZero
+		case "merge":
+			info.flags |= tagMerge
 		default:
 			r := []rune(part)
 			if len(r) == 0 || !unicode.IsUpper(r[0]) {
@@ -2078,7 +2175,25 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 	if field.insensitive {
 		fmt.Fprintln(b, "if !opt.CaseSensitive {")
 	}
-	if field.converter {
+	if field.flags&tagNullIfZero != 0 {
+		fmt.Fprintf(b, "if %s != nil && %s.IsZero() {\n", field.srcExpr, field.srcExpr)
+		fmt.Fprintf(b, "to.%s = nil\n", field.dstName)
+		fmt.Fprintln(b, "} else {")
+	}
+	renderFieldCopyBody(b, field, currentPkg)
+	if field.flags&tagNullIfZero != 0 {
+		fmt.Fprintln(b, "}")
+	}
+	if field.insensitive {
+		fmt.Fprintln(b, "}")
+	}
+}
+
+func renderFieldCopyBody(b *bytes.Buffer, field fieldCopy, currentPkg string) {
+	if field.nestedValue {
+		fmt.Fprintf(b, "if err := %s(&to.%s, &%s, opt); err != nil { return err }\n",
+			nestedMapperNameForField(field), field.dstName, field.srcExpr)
+	} else if field.converter {
 		renderCopyBlockStart(b, field)
 		if field.converterContext {
 			fmt.Fprintf(b, "converter, ok := copier.FindConverterContext[%s, %s](opt.Converters)\n",
@@ -2206,9 +2321,6 @@ func renderFieldCopy(b *bytes.Buffer, field fieldCopy, currentPkg string) {
 	} else {
 		fmt.Fprintf(b, "if !copiergen.ShouldIgnoreEmpty(%s, %d, opt) {\n", field.zeroExpr, field.flags)
 		fmt.Fprintf(b, "to.%s = %s\n", field.dstName, field.assignExpr)
-		fmt.Fprintln(b, "}")
-	}
-	if field.insensitive {
 		fmt.Fprintln(b, "}")
 	}
 }

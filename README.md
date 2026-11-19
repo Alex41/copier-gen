@@ -159,6 +159,8 @@ Generated code supports the copier tags:
 | `copier:"override"` | Copy zero values even with `IgnoreEmpty`. |
 | `copier:"init_slice"` | Initialize a destination slice as empty instead of nil when the source slice is nil. |
 | `copier:"no_warn"` | Suppress generation warnings for this destination field. |
+| `copier:"null_if_zero"` | Set the destination pointer to nil when the source pointer's value reports `IsZero()` (`0001-01-01T00:00:00Z` clears a `*time.Time`). Needs a pointer source whose type has `IsZero() bool` and a pointer destination, else generation fails. |
+| `copier:"merge"` | Copy a struct value field (embedded or not) field by field through a nested mapper instead of assigning it whole, so `IgnoreEmpty` keeps the destination's fields the source leaves empty. Needs a named struct on both sides. |
 | `copier:"OtherName"` | Map fields by explicit name. |
 
 Supported options:
